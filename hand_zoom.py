@@ -252,6 +252,11 @@ def _dim(color, k):
     return (int(color[0] * k), int(color[1] * k), int(color[2] * k))
 
 
+def _rot2(v, ang):
+    c, s = math.cos(ang), math.sin(ang)
+    return (v[0] * c - v[1] * s, v[0] * s + v[1] * c)
+
+
 def draw_hand_holo(frame, hand, alpha: float = 0.55) -> None:
     """Draw the hand as a translucent cyan hologram skeleton."""
     h, w = frame.shape[:2]
@@ -272,28 +277,201 @@ def draw_hand_holo(frame, hand, alpha: float = 0.55) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# The holographic web-shooter
+# Gesture tracker: raw hand features -> discrete gesture events
+# --------------------------------------------------------------------------- #
+class GestureTracker:
+    """Turns smoothed per-hand features into gesture events.
+
+    Events (tuples):
+      ('spawn', feat)    a single fist held ~0.45 s then opened
+                         -> show a holographic gadget blueprint
+      ('grab', feat)     the RIGHT hand begins pinching
+                         -> detach the web-shooter / call it back
+      ('release', feat)  the RIGHT hand stops pinching
+                         -> let the web-shooter float where it is
+      ('gear', None)     BOTH fists held ~0.6 s then opened
+                         -> toggle the holographic body gear
+
+    Per-hand features are EMA-smoothed (with matching by palm proximity), and
+    hands that drop out for a few frames keep their state ("ghosting") so a
+    tracking hiccup never cancels a gesture mid-way.
+    """
+
+    FIST_HOLD = 0.45        # seconds a single fist must be held before open
+    GEAR_HOLD = 0.60        # seconds both fists must be held before open
+    GRAB_ON = 0.20          # pinch3 below this -> pinch begins
+    GRAB_OFF = 0.30         # pinch3 above this -> pinch ends
+    PINCH_CONFIRM = 2       # frames of confirmation before a pinch edge
+    GHOST_TTL = 0.18        # seconds a dropped hand keeps its state
+
+    def __init__(self):
+        self._slots: list = []
+        self._both_fist_since: float | None = None
+
+    # -- public ------------------------------------------------------------- #
+    def feed(self, hands: list, t: float) -> list:
+        events: list = []
+        for s in self._slots:
+            s["matched"] = False
+            s["suppress"] = False
+        for h in hands:
+            s = self._match(h)
+            if s is None:
+                s = self._new_slot(h, t)
+                self._slots.append(s)
+            else:
+                s["matched"] = True
+                s["last_seen"] = t
+                self._apply(s, h)
+        # prune hands that have been gone too long
+        for s in [x for x in self._slots
+                  if not x["matched"] and t - x["last_seen"] > self.GHOST_TTL]:
+            self._slots.remove(s)
+        # -- both-fists -> gear (ghosts keep a held fist "present" briefly) --
+        fists = [s for s in self._slots
+                 if s["fist"] and t - s["last_seen"] <= self.GHOST_TTL]
+        if len(fists) >= 2:
+            if self._both_fist_since is None:
+                self._both_fist_since = t
+        elif self._both_fist_since is not None:
+            held = t - self._both_fist_since
+            self._both_fist_since = None
+            if held >= self.GEAR_HOLD:
+                events.append(("gear", None))
+                for s in self._slots:      # consume the whole fist cycle so
+                    s["spawn_fired"] = True  # the opener doesn't also spawn
+                    s["suppress"] = True
+        # -- per-slot gesture edges --
+        for s in self._slots:
+            if s["matched"]:
+                self._pinch_edges(s, t, events)
+                self._fist_events(s, t, events)
+        return events
+
+    # -- internals ----------------------------------------------------------- #
+    def _match(self, h):
+        best, bd = None, 0.5        # max normalised match distance
+        for s in self._slots:
+            if s["matched"]:
+                continue
+            d = float(np.linalg.norm(s["palm"] - h["palm"]))
+            if d < bd:
+                bd, best = d, s
+        return best
+
+    def _new_slot(self, h, t):
+        s = {
+            "palm": h["palm"], "wrist": h["wrist"], "mcp9": h["mcp9"],
+            "index_tip": h["index_tip"], "middle_tip": h["middle_tip"],
+            "thumb_tip": h["thumb_tip"], "is_right": h["is_right"],
+            "landmarks": h["landmarks"], "hand": h,
+            "curls": None, "pinch3": 0.5, "spread": 0.5, "fist": False,
+            "matched": True, "last_seen": t,
+            "fist_since": None, "spawn_fired": False,
+            "pinch": False, "pinch_frames": 0, "suppress": False,
+        }
+        self._apply(s, h)
+        return s
+
+    def _apply(self, s, h):
+        if s["curls"] is None:
+            s["curls"] = dict(h["curls"])
+            s["pinch3"] = h["pinch3"]
+            s["spread"] = h["spread"]
+        else:
+            a = 0.45
+            for k in ("thumb", "index", "middle", "ring", "pinky"):
+                s["curls"][k] = a * h["curls"][k] + (1.0 - a) * s["curls"][k]
+            s["pinch3"] = 0.40 * h["pinch3"] + 0.60 * s["pinch3"]
+            s["spread"] = 0.40 * h["spread"] + 0.60 * s["spread"]
+        s["palm"] = h["palm"]
+        s["wrist"] = h["wrist"]
+        s["mcp9"] = h["mcp9"]
+        s["index_tip"] = h["index_tip"]
+        s["middle_tip"] = h["middle_tip"]
+        s["thumb_tip"] = h["thumb_tip"]
+        s["is_right"] = h["is_right"]
+        s["landmarks"] = h["landmarks"]
+        s["hand"] = h
+        c = s["curls"]
+        s["fist"] = (c["index"] < 0.55 and c["middle"] < 0.55
+                     and c["ring"] < 0.55 and c["pinky"] < 0.55
+                     and c["thumb"] < 0.75)
+
+    def _pinch_edges(self, s, t, events):
+        p = s["pinch3"] < self.GRAB_ON
+        s["pinch_frames"] = min(s["pinch_frames"] + 1, 6) if p \
+            else max(s["pinch_frames"] - 1, 0)
+        if p and s["pinch_frames"] >= self.PINCH_CONFIRM and not s["pinch"]:
+            s["pinch"] = True
+            if s["is_right"]:
+                events.append(("grab", s["hand"]))
+        elif not p and s["pinch_frames"] == 0 and s["pinch"]:
+            s["pinch"] = False
+            if s["is_right"]:
+                events.append(("release", s["hand"]))
+
+    def _fist_events(self, s, t, events):
+        if not s["matched"]:
+            return
+        if s["fist"]:
+            if s["fist_since"] is None:
+                s["fist_since"] = t
+                s["spawn_fired"] = False      # new fist cycle
+        elif s["fist_since"] is not None:
+            held = t - s["fist_since"]
+            s["fist_since"] = None
+            if (held >= self.FIST_HOLD and not s["spawn_fired"]
+                    and not s["suppress"] and s["curls"]["index"] > 0.55):
+                events.append(("spawn", s["hand"]))
+                s["spawn_fired"] = True
+
+
+# --------------------------------------------------------------------------- #
+# The holographic web-shooter (detachable!)
 # --------------------------------------------------------------------------- #
 class WebShooterHologram:
-    """Tony-Stark-style holographic web-shooter rendered on the wrist.
+    """Tony-Stark-style holographic web-shooter with a grab/detach lifecycle.
 
-    Everything is drawn on a transparent overlay and additively blended into
-    the frame for the see-through "hard-light" hologram look.  The assembly is
-    anchored to the wrist and scales + rotates with the hand, so it looks
-    bolted on no matter how the hand is held.  Pure 2D vector drawing - a
-    handful of cv2 calls per frame, so it runs at full webcam speed.
+    States
+    ------  on        bolted to the wrist, follows the hand
+            detach    animation lifting it off the wrist into a pinch
+            held      floating above the pinching hand, following it
+            float     parked in mid-air (gentle bob + slow drift)
+            reattach  streak animation flying it back onto the wrist
+
+    The whole assembly is drawn from an "orientation" (anchor, aim direction,
+    hand axes) that is refreshed from the live hand while 'on'/'held' and
+    frozen while floating, so the hologram stays coherent when airborne.
     """
+
+    DETACH_DUR = 0.50
+    REATTACH_DUR = 0.42
 
     def __init__(self):
         self._rng = np.random.default_rng(7)
-        self._orbits = self._rng.uniform(0, 2 * math.pi, 9)      # particle phases
-        self._bars = self._rng.uniform(0, 2 * math.pi, 5)        # HUD bar phases
+        self._orbits = self._rng.uniform(0, 2 * math.pi, 9)
+        self._bars = self._rng.uniform(0, 2 * math.pi, 5)
+        self.state = "on"
+        self._state_t = 0.0
+        self._geo = None            # frozen orientation bundle
+        self._pos = None            # current pixel anchor
+        self._ang = 0.0
+        self._scale = 1.0
+        self._R = 60.0
+        self._ax = (0.0, -1.0)
+        self._side = (1.0, 0.0)
+        self._aim_u = (1.0, 0.0)
+        self._aim_len = 60.0
+        self._from_px = None
+        self._hold_target = None
+        self._pinch_px = None
+        self._hold_off = (0.0, 0.0)
+        self._float_px = None
+        self._burst = None          # (t0, pos, R) shockwave flare
+        self._trail = []            # reattach streak ghosts
 
-    # -- tiny helpers ------------------------------------------------------ #
-    @staticmethod
-    def _px(hand, i, w, h):
-        return (hand[i].x * w, hand[i].y * h)
-
+    # -- geometry ------------------------------------------------------------ #
     @staticmethod
     def _ell_pt(cx, cy, a, b, ang, phi):
         """Point on a rotated ellipse (ang, phi in radians)."""
@@ -302,57 +480,162 @@ class WebShooterHologram:
         y = a * math.cos(phi) * s + b * math.sin(phi) * c
         return (cx + x, cy + y)
 
-    # -- main entry -------------------------------------------------------- #
-    def draw(self, frame, hand, t) -> None:
-        if hand is None:
-            return
-        h, w = frame.shape[:2]
-        W = self._px(hand, 0, w, h)             # wrist
-        M = self._px(hand, 9, w, h)             # middle MCP
-        T = self._px(hand, 4, w, h)             # thumb tip
-        L = math.hypot(M[0] - W[0], M[1] - W[1])
+    def _orient_from_feat(self, feat, w, h):
+        W = feat["wrist"] * np.array([w, h])
+        M = feat["mcp9"] * np.array([w, h])
+        T = feat["thumb_tip"] * np.array([w, h])
+        L = float(np.linalg.norm(M - W))
         if L < 12:
-            return                              # hand too far / tiny
-
-        ax = ((M[0] - W[0]) / L, (M[1] - W[1]) / L)   # wrist -> fingers
-        side = (-ax[1], ax[0])                        # across the wrist
+            return None
+        ax = ((M[0] - W[0]) / L, (M[1] - W[1]) / L)      # wrist -> fingers
+        side = (-ax[1], ax[0])
         if side[0] * (T[0] - W[0]) + side[1] * (T[1] - W[1]) < 0:
-            side = (-side[0], -side[1])               # point toward the thumb
+            side = (-side[0], -side[1])                  # toward the thumb
+        C = (W[0] + ax[0] * 0.34 * L, W[1] + ax[1] * 0.34 * L)
+        I = feat["index_tip"] * np.array([w, h])
+        aim_len = float(np.linalg.norm(I - C)) or 1.0
+        aim_u = ((I[0] - C[0]) / aim_len, (I[1] - C[1]) / aim_len)
+        return {"W": W, "M": M, "L": L, "ax": ax, "side": side,
+                "C": C, "R": 0.52 * L, "ang": math.atan2(side[1], side[0]),
+                "I": I, "aim_u": aim_u, "aim_len": aim_len}
 
-        C = (W[0] + ax[0] * 0.34 * L, W[1] + ax[1] * 0.34 * L)  # shooter core
-        R = 0.52 * L
-        ang = math.atan2(side[1], side[0]) + 0.06 * math.sin(t * 1.4)
-        a_ring, b_ring = R, 0.40 * R
+    def _refresh_orient(self, feat, w, h):
+        g = self._orient_from_feat(feat, w, h)
+        if g is not None:
+            self._geo = g
+            self._R = g["R"]
+            self._ax = g["ax"]
+            self._side = g["side"]
+            self._aim_u = g["aim_u"]
+            self._aim_len = g["aim_len"]
+            self._ang = g["ang"]
 
+    # -- gesture entry points ------------------------------------------------ #
+    def grab(self, feat, w, h, t):
+        """Pinch: take the shooter off the wrist, or call a floating one back."""
+        if self.state == "on":
+            if self._geo is None:
+                return
+            self.state = "detach"
+            self._state_t = 0.0
+            self._burst = None
+            self._from_px = self._geo["C"]
+            pinch = feat["palm"] * np.array([w, h])
+            self._pinch_px = (float(pinch[0]), float(pinch[1]))
+            ax, side = self._ax, self._side
+            self._hold_off = (ax[0] * 0.55 + side[0] * 0.25,
+                              ax[1] * 0.55 + side[1] * 0.25)
+            self._hold_off = (self._hold_off[0] * self._R,
+                              self._hold_off[1] * self._R)
+            self._hold_target = (self._pinch_px[0] + self._hold_off[0],
+                                 self._pinch_px[1] + self._hold_off[1])
+        elif self.state == "float":
+            self.state = "reattach"
+            self._state_t = 0.0
+            self._float_px = (self._pos[0], self._pos[1]) if self._pos \
+                else self._hold_target
+            self._trail.clear()
+
+    def release(self, feat, w, h, t):
+        """Pinch released: the shooter stays floating where it is."""
+        if self.state in ("held", "detach"):
+            self.state = "float"
+            self._state_t = 0.0
+            self._float_px = (self._pos[0], self._pos[1]) if self._pos \
+                else self._hold_target
+
+    # -- per-frame update ---------------------------------------------------- #
+    def update(self, dt, t, feat, w, h):
+        self._state_t += dt
+        if feat is not None:
+            self._refresh_orient(feat, w, h)
+        if self.state == "on":
+            if self._geo is not None:
+                self._pos = self._geo["C"]
+                self._ang = self._geo["ang"]
+                self._scale = 1.0
+            else:
+                self._pos = None          # hand gone -> shooter gone
+        elif self.state == "detach":
+            f = min(1.0, self._state_t / self.DETACH_DUR)
+            e = 1.0 - (1.0 - f) ** 3      # ease-out cubic
+            fx, fy = self._from_px
+            tx, ty = self._hold_target
+            self._pos = (fx + (tx - fx) * e, fy + (ty - fy) * e)
+            self._scale = 1.0 + 0.12 * math.sin(f * math.pi)
+            if f >= 0.35 and self._burst is None:
+                self._burst = (t, self._hold_target, self._R)
+            if f >= 1.0:
+                self.state = "held"
+                self._state_t = 0.0
+                self._pos = self._hold_target
+        elif self.state == "held":
+            if feat is not None:
+                self._refresh_orient(feat, w, h)
+                pinch = feat["palm"] * np.array([w, h])
+                self._pinch_px = (float(pinch[0]), float(pinch[1]))
+            self._pos = (self._pinch_px[0] + self._hold_off[0],
+                         self._pinch_px[1] + self._hold_off[1]
+                         + 0.035 * self._R * math.sin(t * 2.2))
+            self._scale = 1.05
+        elif self.state == "float":
+            self._pos = (self._float_px[0],
+                         self._float_px[1] + 0.035 * self._R * math.sin(t * 1.7))
+            self._ang = self._geo["ang"] + 0.12 * math.sin(t * 0.6) \
+                if self._geo else self._ang
+            self._scale = 1.0
+        elif self.state == "reattach":
+            f = min(1.0, self._state_t / self.REATTACH_DUR)
+            e = f * f * (3.0 - 2.0 * f)   # smoothstep
+            target = self._geo["C"] if self._geo is not None else self._float_px
+            self._pos = (self._float_px[0] + (target[0] - self._float_px[0]) * e,
+                         self._float_px[1] + (target[1] - self._float_px[1]) * e)
+            self._scale = 1.0 - 0.10 * e
+            self._trail.append((self._pos[0], self._pos[1], t))
+            if len(self._trail) > 6:
+                self._trail.pop(0)
+            if f >= 1.0:
+                self.state = "on"
+                self._state_t = 0.0
+                self._trail.clear()
+
+    # -- rendering ----------------------------------------------------------- #
+    def draw(self, frame, t):
+        if self._pos is None:
+            return
+        w, h = frame.shape[1], frame.shape[0]
+        C = self._pos
+        R = self._R * self._scale
+        if R < 8:
+            return
+        ang = self._ang + 0.06 * math.sin(t * 1.4)
         overlay = np.zeros_like(frame)
-        self._draw_core(frame, overlay, hand, w, h, C, R, ang, a_ring, b_ring, t)
-        self._draw_rings(overlay, C, R, ang, a_ring, b_ring, t)
-        self._draw_threads(overlay, hand, w, h, C, ax, L, t)
-        self._draw_cartridge(overlay, hand, w, h, C, L, t)
-        self._draw_panels(overlay, C, side, ax, R, t)
-        self._draw_particles(overlay, C, R, ang, a_ring, b_ring, t)
+        self._draw_core(overlay, w, h, C, R, ang, t)
+        self._draw_rings(overlay, C, R, ang, t)
+        self._draw_threads(overlay, C, R, t)
+        self._draw_cartridge(overlay, C, R, t)
+        self._draw_panels(overlay, C, R, t)
+        self._draw_particles(overlay, C, R, ang, t)
         self._draw_sweep(overlay, C, R, t)
-
-        # hologram flicker: subtle constant shimmer, never fully off
+        self._draw_state_fx(overlay, C, R, t)
+        # hologram flicker: constant shimmer, never fully off
         alpha = 0.78 * (0.92 + 0.08 * math.sin(t * 21.3) * math.sin(t * 7.7))
-        # hard-light glow: a HALF-RES blurred pass (halo) + the crisp lines.
+        # hard-light glow via a HALF-RES blurred pass (cheap at 720p)
         sw, sh = max(1, w // 2), max(1, h // 2)
         glow = cv2.GaussianBlur(cv2.resize(overlay, (sw, sh)), (0, 0), 1.4)
         glow = cv2.resize(glow, (w, h), interpolation=cv2.INTER_LINEAR)
         cv2.addWeighted(glow, 0.9, frame, 1.0, 0, frame)
         cv2.addWeighted(overlay, max(alpha, 0.25), frame, 1.0, 0, frame)
 
-    # -- layers ------------------------------------------------------------- #
-    def _draw_core(self, frame, overlay, hand, w, h, C, R, ang, a, b, t):
-        # faint scanlines + soft glow inside the hologram's bounding box
-        x0 = max(0, int(C[0] - 1.5 * R)); x1 = min(frame.shape[1], int(C[0] + 1.5 * R))
-        y0 = max(0, int(C[1] - 1.5 * R)); y1 = min(frame.shape[0], int(C[1] + 1.5 * R))
+    # -- layers -------------------------------------------------------------- #
+    def _draw_core(self, overlay, w, h, C, R, ang, t):
+        x0 = max(0, int(C[0] - 1.5 * R)); x1 = min(w, int(C[0] + 1.5 * R))
+        y0 = max(0, int(C[1] - 1.5 * R)); y1 = min(h, int(C[1] + 1.5 * R))
         for yy in range(y0, y1, 6):
             cv2.line(overlay, (x0, yy), (x1, yy), _dim(HOLO_DIM, 0.22), 1)
         cv2.circle(overlay, (int(C[0]), int(C[1])), int(0.30 * R),
                    _dim(HOLO_BLUE, 0.30), -1, cv2.LINE_AA)
-
-        # arc-reactor core: inner ring + rotating sweep
+        # arc-reactor core: inner ring + rotating white sweep
         cv2.ellipse(overlay, (int(C[0]), int(C[1])), (int(0.20 * R), int(0.085 * R)),
                     math.degrees(ang), 0, 360, _dim(HOLO_CYAN, 0.9), 2, cv2.LINE_AA)
         phi = t * 2.2
@@ -360,61 +643,52 @@ class WebShooterHologram:
         p2 = self._ell_pt(*C, 0.20 * R, 0.085 * R, ang, phi + 0.9)
         cv2.line(overlay, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])),
                  (255, 255, 255), 3, cv2.LINE_AA)
-
-        # radial tick marks slowly rotating around the core
         for i in range(12):
             ph = t * 0.25 + i * 2 * math.pi / 12
             q1 = self._ell_pt(*C, 0.88 * R, 0.35 * R, ang, ph)
             q2 = self._ell_pt(*C, 1.04 * R, 0.42 * R, ang, ph)
             cv2.line(overlay, (int(q1[0]), int(q1[1])), (int(q2[0]), int(q2[1])),
                      _dim(HOLO_CYAN, 0.5), 1, cv2.LINE_AA)
-
-        # occasional "data refresh" flash
-        if (t * 0.5) % 1.0 < 0.12:
+        if (t * 0.5) % 1.0 < 0.12:      # occasional "data refresh" flash
             cv2.ellipse(overlay, (int(C[0]), int(C[1])), (int(0.20 * R), int(0.085 * R)),
                         math.degrees(ang), 0, 360, (255, 255, 255), 3, cv2.LINE_AA)
 
-    def _draw_rings(self, overlay, C, R, ang, a, b, t):
+    def _draw_rings(self, overlay, C, R, ang, t):
         cx, cy = int(C[0]), int(C[1])
-        # three concentric wrist rings, brighter toward the outside
         for k, (scale, alpha_k) in enumerate(((0.72, 0.30), (1.0, 0.55), (1.15, 0.75))):
-            cv2.ellipse(overlay, (cx, cy), (int(a * scale), int(b * scale)),
+            cv2.ellipse(overlay, (cx, cy), (int(R * scale), int(0.40 * R * scale)),
                         math.degrees(ang), 0, 360, _dim(HOLO_CYAN, alpha_k),
                         2 if k < 2 else 1, cv2.LINE_AA)
-        # outer dashed ring: two bright arcs + two dim arcs rotating
         base = math.degrees(ang) + (t * 26.0) % 360
-        for off in (0, 180):
-            cv2.ellipse(overlay, (cx, cy), (int(a * 1.15), int(b * 1.15)),
+        for off in (0, 180):            # rotating dashed outer ring
+            cv2.ellipse(overlay, (cx, cy), (int(R * 1.15), int(0.40 * R * 1.15)),
                         base + off, 0, 150, _dim(HOLO_CYAN, 0.85), 2, cv2.LINE_AA)
-            cv2.ellipse(overlay, (cx, cy), (int(a * 1.15), int(b * 1.15)),
+            cv2.ellipse(overlay, (cx, cy), (int(R * 1.15), int(0.40 * R * 1.15)),
                         base + off + 165, 0, 30, _dim(HOLO_BLUE, 0.4), 2, cv2.LINE_AA)
-        # two bright energy arcs sweeping the main ring
-        for i in range(2):
+        for i in range(2):              # bright energy arcs sweeping the ring
             ph0 = t * 1.6 + i * math.pi
-            pts = [self._ell_pt(*C, a, b, ang, ph0 + j * 0.05) for j in range(14)]
+            pts = [self._ell_pt(*C, R, 0.40 * R, ang, ph0 + j * 0.05) for j in range(14)]
             cv2.polylines(overlay, [np.array(pts, np.int32)], False,
                           (255, 255, 255), 2, cv2.LINE_AA)
 
-    def _draw_threads(self, overlay, hand, w, h, C, ax, L, t):
-        # energy threads from the cartridge toward the fingertips
-        N = (C[0] + ax[0] * 0.55 * L, C[1] + ax[1] * 0.55 * L)
-        for i, ph in ((INDEX_TIP, 0.0), (MIDDLE_TIP, 2.1)):
-            P = self._px(hand, i, w, h)
-            k = 0.35 + 0.3 * math.sin(t * 3.0 + ph)
-            cv2.line(overlay, (int(N[0]), int(N[1])), (int(P[0]), int(P[1])),
+    def _draw_threads(self, overlay, C, R, t):
+        N = (C[0] + self._aim_u[0] * 0.55 * self._aim_len,
+             C[1] + self._aim_u[1] * 0.55 * self._aim_len)
+        for i, off in ((0, 0.0), (1, 0.55)):    # toward index + middle tips
+            ux, uy = _rot2(self._aim_u, off)
+            tip = (C[0] + ux * self._aim_len * 0.95,
+                   C[1] + uy * self._aim_len * 0.95)
+            k = 0.35 + 0.3 * math.sin(t * 3.0 + i * 2.1)
+            cv2.line(overlay, (int(N[0]), int(N[1])), (int(tip[0]), int(tip[1])),
                      _dim(HOLO_CYAN, k), 2, cv2.LINE_AA)
 
-    def _draw_cartridge(self, overlay, hand, w, h, C, L, t):
-        # the web-shooter cartridge: a glowing barrel on the palm aiming at
-        # the index finger, with a draining/refilling web-fluid gauge
-        I = self._px(hand, INDEX_TIP, w, h)
-        dx, dy = I[0] - C[0], I[1] - C[1]
-        d = math.hypot(dx, dy) or 1.0
-        u = (dx / d, dy / d)
+    def _draw_cartridge(self, overlay, C, R, t):
+        u = self._aim_u
+        d = self._aim_len
         p = (-u[1], u[0])
-        b0 = (C[0] + u[0] * 0.30 * L, C[1] + u[1] * 0.30 * L)
-        b1 = (C[0] + u[0] * 0.85 * L, C[1] + u[1] * 0.85 * L)
-        half = 0.085 * L
+        b0 = (C[0] + u[0] * 0.30 * R, C[1] + u[1] * 0.30 * R)
+        b1 = (C[0] + u[0] * 0.85 * R, C[1] + u[1] * 0.85 * R)
+        half = 0.085 * R
         quad = [(b0[0] + p[0] * half, b0[1] + p[1] * half),
                 (b0[0] - p[0] * half, b0[1] - p[1] * half),
                 (b1[0] - p[0] * half * 1.25, b1[1] - p[1] * half * 1.25),
@@ -422,36 +696,31 @@ class WebShooterHologram:
         cv2.fillPoly(overlay, [np.array(quad, np.int32)], _dim(HOLO_BLUE, 0.30))
         cv2.polylines(overlay, [np.array(quad, np.int32)], True,
                       _dim(HOLO_CYAN, 0.85), 1, cv2.LINE_AA)
-
-        # web-fluid gauge: 4 orange segments that drain and refill
-        lit = 1 + int(3 * (0.5 + 0.5 * math.sin(t * 1.2)))
+        lit = 1 + int(3 * (0.5 + 0.5 * math.sin(t * 1.2)))   # fluid gauge
         for i in range(4):
             f = 0.30 + (i + 0.5) * 0.14
-            gx = b0[0] + u[0] * f * L + p[0] * half * 1.6
-            gy = b0[1] + u[1] * f * L + p[1] * half * 1.6
+            gx = b0[0] + u[0] * f * R + p[0] * half * 1.6
+            gy = b0[1] + u[1] * f * R + p[1] * half * 1.6
             col = HOLO_ORANGE if i < lit else _dim(HOLO_ORANGE, 0.18)
-            cv2.circle(overlay, (int(gx), int(gy)), max(2, int(0.022 * L)), col, -1)
-
-        # nozzle: white core + orange tip + outer glow ring
-        nz = (int(b1[0]), int(b1[1]))
-        cv2.circle(overlay, nz, int(0.075 * L), _dim(HOLO_BLUE, 0.5), 2, cv2.LINE_AA)
-        cv2.circle(overlay, nz, int(0.045 * L), HOLO_ORANGE, -1, cv2.LINE_AA)
-        cv2.circle(overlay, nz, max(2, int(0.018 * L)), (255, 255, 255), -1)
-
-        # faint projection cone from the nozzle toward the index fingertip
-        tip = (int(I[0]), int(I[1]))
-        cone = np.array([nz, (tip[0] - int(p[0] * 0.09 * L), tip[1] - int(p[1] * 0.09 * L)),
-                         (tip[0] + int(p[0] * 0.09 * L), tip[1] + int(p[1] * 0.09 * L))],
+            cv2.circle(overlay, (int(gx), int(gy)), max(2, int(0.022 * R)),
+                       col, -1, cv2.LINE_AA)
+        nz = (int(b1[0]), int(b1[1]))                      # nozzle
+        cv2.circle(overlay, nz, int(0.075 * R), _dim(HOLO_BLUE, 0.5), 2, cv2.LINE_AA)
+        cv2.circle(overlay, nz, int(0.045 * R), HOLO_ORANGE, -1, cv2.LINE_AA)
+        cv2.circle(overlay, nz, max(2, int(0.018 * R)), (255, 255, 255), -1)
+        tip = (C[0] + u[0] * d, C[1] + u[1] * d)           # projection cone
+        cone = np.array([nz,
+                         (int(tip[0] - p[0] * 0.09 * R), int(tip[1] - p[1] * 0.09 * R)),
+                         (int(tip[0] + p[0] * 0.09 * R), int(tip[1] + p[1] * 0.09 * R))],
                         np.int32)
         cv2.fillPoly(overlay, [cone], _dim(HOLO_BLUE, 0.10))
 
-    def _draw_panels(self, overlay, C, side, ax, R, t):
-        # two floating HUD panels beside the wrist, tilted like holoscreens
-        u = side
-        v = (-ax[0], -ax[1])
-        pa = (C[0] + side[0] * 1.32 * R, C[1] + side[1] * 1.32 * R)
+    def _draw_panels(self, overlay, C, R, t):
+        u = self._side
+        v = (-self._ax[0], -self._ax[1])
+        pa = (C[0] + u[0] * 1.32 * R, C[1] + u[1] * 1.32 * R)
         self._panel_a(overlay, pa, u, v, 0.62 * R, 0.34 * R, t)
-        pb = (C[0] + side[0] * 1.36 * R, C[1] + side[1] * 1.36 * R - 0.5 * R)
+        pb = (C[0] + u[0] * 1.36 * R, C[1] + u[1] * 1.36 * R - 0.5 * R)
         self._panel_b(overlay, pb, u, v, 0.42 * R, 0.30 * R, t)
 
     def _panel_a(self, overlay, c, u, v, wd, ht, t):
@@ -462,20 +731,18 @@ class WebShooterHologram:
         quad = np.array(corners, np.int32)
         cv2.fillPoly(overlay, [quad], _dim(HOLO_BLUE, 0.16))
         cv2.polylines(overlay, [quad], True, _dim(HOLO_CYAN, 0.7), 1, cv2.LINE_AA)
-        # animated data bars: horizontal stub + vertical bar growing upward
-        for i in range(5):
+        for i in range(5):                                  # animated data bars
             f = 0.20 + 0.60 * (0.5 + 0.5 * math.sin(t * 2.4 + self._bars[i]))
             bx = c[0] + u[0] * (wd * (i / 4.0 - 0.5) + 0.05 * wd)
             by = c[1] + u[1] * (wd * (i / 4.0 - 0.5) + 0.05 * wd)
-            bx2 = bx + u[0] * (0.05 * wd)
-            by2 = by + u[1] * (0.05 * wd)
             bh = 0.35 * ht * f
-            cv2.line(overlay, (int(bx), int(by)), (int(bx2), int(by2)),
-                     _dim(HOLO_CYAN, 0.85), 2)
-            cv2.line(overlay, (int(bx2), int(by2)), (int(bx2 + v[0] * bh), int(by2 + v[1] * bh)),
+            cv2.line(overlay, (int(bx), int(by)), (int(bx + u[0] * 0.05 * wd),
+                     int(by + u[1] * 0.05 * wd)), _dim(HOLO_CYAN, 0.85), 2)
+            cv2.line(overlay, (int(bx + u[0] * 0.05 * wd), int(by + u[1] * 0.05 * wd)),
+                     (int(bx + u[0] * 0.05 * wd + v[0] * bh),
+                      int(by + u[1] * 0.05 * wd + v[1] * bh)),
                      _dim(HOLO_CYAN, 0.85), 1)
-        # waveform line along the bottom edge
-        pts = []
+        pts = []                                            # waveform
         for i in range(24):
             f = i / 23.0
             sx = c[0] + u[0] * wd * (f - 0.5) - v[0] * ht * 0.55
@@ -494,8 +761,7 @@ class WebShooterHologram:
         quad = np.array(corners, np.int32)
         cv2.fillPoly(overlay, [quad], _dim(HOLO_BLUE, 0.14))
         cv2.polylines(overlay, [quad], True, _dim(HOLO_CYAN, 0.6), 1, cv2.LINE_AA)
-        # gauge arc + rotating needle
-        cc = (int(c[0]), int(c[1]))
+        cc = (int(c[0]), int(c[1]))                         # gauge + needle
         cv2.ellipse(overlay, cc, (int(wd * 0.62), int(ht * 0.62)),
                     90, 200, 340, _dim(HOLO_CYAN, 0.7), 2, cv2.LINE_AA)
         th = t * 1.8
@@ -503,22 +769,67 @@ class WebShooterHologram:
         ny = c[1] + u[1] * (0.5 * wd) * math.cos(th) - v[1] * (0.5 * ht) * math.sin(th)
         cv2.line(overlay, cc, (int(nx), int(ny)), _dim(HOLO_ORANGE, 0.9), 2, cv2.LINE_AA)
 
-    def _draw_particles(self, overlay, C, R, ang, a, b, t):
-        # tiny holographic motes orbiting the outer ring
+    def _draw_particles(self, overlay, C, R, ang, t):
         for i, ph0 in enumerate(self._orbits):
             ph = ph0 + t * (0.5 + 0.06 * i)
-            p = self._ell_pt(*C, a * 1.08, b * 1.08, ang, ph)
+            p = self._ell_pt(*C, R * 1.08, 0.40 * R * 1.08, ang, ph)
             tw = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(t * 5.0 + ph0 * 3.0))
             cv2.circle(overlay, (int(p[0]), int(p[1])), 2, _dim(HOLO_CYAN, tw), -1)
 
     def _draw_sweep(self, overlay, C, R, t):
-        # a bright scan line sweeping down through the hologram periodically
         period = 1.4
         f = (t % period) / period
         sy = C[1] + (f - 0.5) * 2.6 * R
         x0 = int(C[0] - 1.8 * R); x1 = int(C[0] + 1.8 * R)
         cv2.line(overlay, (x0, int(sy) - 1), (x1, int(sy) - 1), _dim(HOLO_CYAN, 0.3), 1)
         cv2.line(overlay, (x0, int(sy)), (x1, int(sy)), _dim(HOLO_CYAN, 0.75), 1)
+
+    def _draw_state_fx(self, overlay, C, R, t):
+        if self.state in ("held", "detach"):   # grip ring: reads as "active"
+            k = 0.5 + 0.4 * math.sin(t * 6.0)
+            cv2.ellipse(overlay, (int(C[0]), int(C[1])),
+                        (int(1.25 * R), int(0.5 * R)), math.degrees(self._ang),
+                        0, 360, _dim(HOLO_CYAN, k), 1, cv2.LINE_AA)
+        if self.state == "detach":              # snap threads lifting it off
+            f = min(1.0, self._state_t / self.DETACH_DUR)
+            if f < 0.35 and self._from_px is not None:
+                al = 1.0 - f / 0.35
+                for i in range(3):
+                    wd = 0.30 * R * (0.4 + 0.6 * i / 2.0)
+                    sx = self._from_px[0] + (i - 1) * wd
+                    cv2.line(overlay, (int(sx), int(self._from_px[1])),
+                             (int(C[0]), int(C[1])),
+                             (255, 255, 255) if i == 1 else _dim(HOLO_CYAN, 0.7),
+                             max(1, int(2 * al)), cv2.LINE_AA)
+        if self._burst is not None:              # detachment shockwave flare
+            b_t, b_pos, b_R = self._burst
+            age = t - b_t
+            if 0.0 <= age < 0.55:
+                fr = age / 0.55
+                rr = (0.3 + 1.4 * fr) * b_R
+                al = 0.85 * (1.0 - fr)
+                cv2.ellipse(overlay, (int(b_pos[0]), int(b_pos[1])),
+                            (int(rr), int(0.4 * rr)), math.degrees(self._ang),
+                            0, 360, _dim(HOLO_CYAN, al), 2, cv2.LINE_AA)
+                cv2.circle(overlay, (int(b_pos[0]), int(b_pos[1])),
+                           int(rr * 0.5), _dim(HOLO_ORANGE, al * 0.6), 1, cv2.LINE_AA)
+                for i in range(10):              # radial particle burst
+                    ph = i * 2 * math.pi / 10 + age * 3.0
+                    px = b_pos[0] + math.cos(ph) * rr
+                    py = b_pos[1] + math.sin(ph) * rr * 0.4
+                    cv2.circle(overlay, (int(px), int(py)), 2,
+                               _dim(HOLO_CYAN, al), -1)
+            elif age >= 0.55:
+                self._burst = None
+        for (tx, ty, tt) in self._trail:         # reattach streak ghosts
+            age = t - tt
+            if age < 0.35:
+                al = 0.5 * (1.0 - age / 0.35)
+                cv2.ellipse(overlay, (int(tx), int(ty)),
+                            (int(R * 0.9), int(0.36 * R)),
+                            math.degrees(self._ang), 0, 360,
+                            _dim(HOLO_CYAN, al), 1, cv2.LINE_AA)
+
 
 
 # --------------------------------------------------------------------------- #
@@ -607,6 +918,7 @@ def run(args: argparse.Namespace) -> int:
             pass
         cv2.resizeWindow(win, 960, 720)
 
+    tracker = GestureTracker()
     holo = WebShooterHologram()
     frame_idx = 0
     last_ts = 0
@@ -682,12 +994,28 @@ def run(args: argparse.Namespace) -> int:
                 print(f"[track] {len(feats)} hand(s) | "
                       f"shooter-hand={'present' if right_feat is not None else 'absent'}")
 
+            # -- gesture events ------------------------------------------------- #
+            now = t0
+            events = tracker.feed(feats, now)
+            for evt, payload in events:
+                if evt == "grab":
+                    holo.grab(payload, frame.shape[1], frame.shape[0], now)
+                    print("[gesture] grab ->", holo.state)
+                elif evt == "release":
+                    holo.release(payload, frame.shape[1], frame.shape[0], now)
+                    print("[gesture] release ->", holo.state)
+
+            # if the right hand vanishes while holding the shooter, let it float
+            if right_feat is None and holo.state in ("held", "detach"):
+                holo.release(None, frame.shape[1], frame.shape[0], now)
+
             # -- render ---------------------------------------------------------- #
             dt = max(0.0, t0 - last_frame_t)
             last_frame_t = t0
             if right_feat is not None:
                 draw_hand_holo(frame, right_feat["landmarks"])
-                holo.draw(frame, right_feat["landmarks"], t0)
+            holo.update(dt, now, right_feat, frame.shape[1], frame.shape[0])
+            holo.draw(frame, now)
 
             if recorder is not None:        # recording: red dot only, no text
                 cv2.circle(frame, (frame.shape[1] - 42, 30), 8, (0, 0, 255), -1)
