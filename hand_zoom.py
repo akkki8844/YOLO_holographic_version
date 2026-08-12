@@ -612,23 +612,26 @@ class WebShooterHologram:
         if R < 8:
             return
         ang = self._ang + 0.06 * math.sin(t * 1.4)
-        overlay = np.zeros_like(frame)
-        self._draw_core(overlay, w, h, C, R, ang, t)
-        self._draw_rings(overlay, C, R, ang, t)
-        self._draw_threads(overlay, C, R, t)
-        self._draw_cartridge(overlay, C, R, t)
-        self._draw_panels(overlay, C, R, t)
-        self._draw_particles(overlay, C, R, ang, t)
-        self._draw_sweep(overlay, C, R, t)
-        self._draw_state_fx(overlay, C, R, t)
+        # render at HALF resolution: the upscale doubles as the glow bloom and
+        # cuts the vector-drawing cost ~4x (the hologram is meant to be soft)
+        k = 0.5
+        w2, h2 = max(2, int(w * k)), max(2, int(h * k))
+        C2 = (C[0] * k, C[1] * k)
+        R2 = R * k
+        overlay = np.zeros((h2, w2, 3), np.uint8)
+        self._draw_core(overlay, w2, h2, C2, R2, ang, t)
+        self._draw_rings(overlay, C2, R2, ang, t)
+        self._draw_threads(overlay, C2, R2, t, k)
+        self._draw_cartridge(overlay, C2, R2, t, k)
+        self._draw_panels(overlay, C2, R2, t)
+        self._draw_particles(overlay, C2, R2, ang, t)
+        self._draw_sweep(overlay, C2, R2, t)
+        self._draw_state_fx(overlay, C2, R2, t, k)
         # hologram flicker: constant shimmer, never fully off
         alpha = 0.78 * (0.92 + 0.08 * math.sin(t * 21.3) * math.sin(t * 7.7))
-        # hard-light glow via a HALF-RES blurred pass (cheap at 720p)
-        sw, sh = max(1, w // 2), max(1, h // 2)
-        glow = cv2.GaussianBlur(cv2.resize(overlay, (sw, sh)), (0, 0), 1.4)
-        glow = cv2.resize(glow, (w, h), interpolation=cv2.INTER_LINEAR)
-        cv2.addWeighted(glow, 0.9, frame, 1.0, 0, frame)
-        cv2.addWeighted(overlay, max(alpha, 0.25), frame, 1.0, 0, frame)
+        overlay = cv2.GaussianBlur(overlay, (0, 0), 0.8)   # extra halo (cheap)
+        bloom = cv2.resize(overlay, (w, h), interpolation=cv2.INTER_LINEAR)
+        cv2.addWeighted(bloom, max(alpha, 0.25), frame, 1.0, 0, frame)
 
     # -- layers -------------------------------------------------------------- #
     def _draw_core(self, overlay, w, h, C, R, ang, t):
@@ -674,20 +677,20 @@ class WebShooterHologram:
             cv2.polylines(overlay, [np.array(pts, np.int32)], False,
                           (255, 255, 255), 2, cv2.LINE_AA)
 
-    def _draw_threads(self, overlay, C, R, t):
-        N = (C[0] + self._aim_u[0] * 0.55 * self._aim_len,
-             C[1] + self._aim_u[1] * 0.55 * self._aim_len)
+    def _draw_threads(self, overlay, C, R, t, sc=1.0):
+        N = (C[0] + self._aim_u[0] * 0.55 * self._aim_len * sc,
+             C[1] + self._aim_u[1] * 0.55 * self._aim_len * sc)
         for i, off in ((0, 0.0), (1, 0.55)):    # toward index + middle tips
             ux, uy = _rot2(self._aim_u, off)
-            tip = (C[0] + ux * self._aim_len * 0.95,
-                   C[1] + uy * self._aim_len * 0.95)
+            tip = (C[0] + ux * self._aim_len * 0.95 * sc,
+                   C[1] + uy * self._aim_len * 0.95 * sc)
             k = 0.35 + 0.3 * math.sin(t * 3.0 + i * 2.1)
             cv2.line(overlay, (int(N[0]), int(N[1])), (int(tip[0]), int(tip[1])),
                      _dim(HOLO_CYAN, k), 2, cv2.LINE_AA)
 
-    def _draw_cartridge(self, overlay, C, R, t):
+    def _draw_cartridge(self, overlay, C, R, t, sc=1.0):
         u = self._aim_u
-        d = self._aim_len
+        d = self._aim_len * sc
         p = (-u[1], u[0])
         b0 = (C[0] + u[0] * 0.30 * R, C[1] + u[1] * 0.30 * R)
         b1 = (C[0] + u[0] * 0.85 * R, C[1] + u[1] * 0.85 * R)
@@ -787,7 +790,7 @@ class WebShooterHologram:
         cv2.line(overlay, (x0, int(sy) - 1), (x1, int(sy) - 1), _dim(HOLO_CYAN, 0.3), 1)
         cv2.line(overlay, (x0, int(sy)), (x1, int(sy)), _dim(HOLO_CYAN, 0.75), 1)
 
-    def _draw_state_fx(self, overlay, C, R, t):
+    def _draw_state_fx(self, overlay, C, R, t, sc=1.0):
         if self.state in ("held", "detach"):   # grip ring: reads as "active"
             k = 0.5 + 0.4 * math.sin(t * 6.0)
             cv2.ellipse(overlay, (int(C[0]), int(C[1])),
@@ -799,8 +802,8 @@ class WebShooterHologram:
                 al = 1.0 - f / 0.35
                 for i in range(3):
                     wd = 0.30 * R * (0.4 + 0.6 * i / 2.0)
-                    sx = self._from_px[0] + (i - 1) * wd
-                    cv2.line(overlay, (int(sx), int(self._from_px[1])),
+                    sx = self._from_px[0] * sc + (i - 1) * wd
+                    cv2.line(overlay, (int(sx), int(self._from_px[1] * sc)),
                              (int(C[0]), int(C[1])),
                              (255, 255, 255) if i == 1 else _dim(HOLO_CYAN, 0.7),
                              max(1, int(2 * al)), cv2.LINE_AA)
@@ -809,17 +812,18 @@ class WebShooterHologram:
             age = t - b_t
             if 0.0 <= age < 0.55:
                 fr = age / 0.55
-                rr = (0.3 + 1.4 * fr) * b_R
+                rr = (0.3 + 1.4 * fr) * b_R * sc
                 al = 0.85 * (1.0 - fr)
-                cv2.ellipse(overlay, (int(b_pos[0]), int(b_pos[1])),
+                bx, by = b_pos[0] * sc, b_pos[1] * sc
+                cv2.ellipse(overlay, (int(bx), int(by)),
                             (int(rr), int(0.4 * rr)), math.degrees(self._ang),
                             0, 360, _dim(HOLO_CYAN, al), 2, cv2.LINE_AA)
-                cv2.circle(overlay, (int(b_pos[0]), int(b_pos[1])),
-                           int(rr * 0.5), _dim(HOLO_ORANGE, al * 0.6), 1, cv2.LINE_AA)
+                cv2.circle(overlay, (int(bx), int(by)), int(rr * 0.5),
+                           _dim(HOLO_ORANGE, al * 0.6), 1, cv2.LINE_AA)
                 for i in range(10):              # radial particle burst
                     ph = i * 2 * math.pi / 10 + age * 3.0
-                    px = b_pos[0] + math.cos(ph) * rr
-                    py = b_pos[1] + math.sin(ph) * rr * 0.4
+                    px = bx + math.cos(ph) * rr
+                    py = by + math.sin(ph) * rr * 0.4
                     cv2.circle(overlay, (int(px), int(py)), 2,
                                _dim(HOLO_CYAN, al), -1)
             elif age >= 0.55:
@@ -828,7 +832,7 @@ class WebShooterHologram:
             age = t - tt
             if age < 0.35:
                 al = 0.5 * (1.0 - age / 0.35)
-                cv2.ellipse(overlay, (int(tx), int(ty)),
+                cv2.ellipse(overlay, (int(tx * sc), int(ty * sc)),
                             (int(R * 0.9), int(0.36 * R)),
                             math.degrees(self._ang), 0, 360,
                             _dim(HOLO_CYAN, al), 1, cv2.LINE_AA)
@@ -936,35 +940,38 @@ class GadgetBlueprint:
         R = self.R * scale_in
         c = self.px
         rot = self._spin + self.t * 0.25
-        overlay = np.zeros_like(frame)
+        # half-res overlay: the upscale doubles as the glow bloom
+        k = 0.5
+        w2, h2 = max(2, int(w * k)), max(2, int(h * k))
+        c2 = (c[0] * k, c[1] * k)
+        R2 = R * k
+        Rf = self.R * k                 # final size: bounding box + focus ring
+        overlay = np.zeros((h2, w2, 3), np.uint8)
 
         # faint bounding-box scanlines + converging focus ring at spawn
-        x0 = max(0, int(c[0] - 1.5 * R)); x1 = min(w, int(c[0] + 1.5 * R))
-        y0 = max(0, int(c[1] - 1.5 * R)); y1 = min(h, int(c[1] + 1.5 * R))
+        x0 = max(0, int(c2[0] - 1.5 * Rf)); x1 = min(w2, int(c2[0] + 1.5 * Rf))
+        y0 = max(0, int(c2[1] - 1.5 * Rf)); y1 = min(h2, int(c2[1] + 1.5 * Rf))
         for yy in range(y0, y1, 7):
             cv2.line(overlay, (x0, yy), (x1, yy), _dim(HOLO_DIM, 0.16), 1)
         if self.t < 0.5:
             fr = self.t / 0.5
-            rr = (2.3 - 1.3 * fr) * R
-            cv2.ellipse(overlay, (int(c[0]), int(c[1])), (int(rr), int(0.4 * rr)),
+            rr = (2.3 - 1.3 * fr) * Rf
+            cv2.ellipse(overlay, (int(c2[0]), int(c2[1])), (int(rr), int(0.4 * rr)),
                         math.degrees(rot), 0, 360,
                         _dim(HOLO_CYAN, 0.8 * (1.0 - fr)), 2, cv2.LINE_AA)
 
         if self.kind == "webshooter":
-            self._draw_ws(overlay, c, R, rot, spread, t=self.t)
+            self._draw_ws(overlay, c2, R2, rot, spread, t=self.t)
         elif self.kind == "cartridge":
-            self._draw_cart(overlay, c, R, rot, spread, t=self.t)
+            self._draw_cart(overlay, c2, R2, rot, spread, t=self.t)
         else:
-            self._draw_drone(overlay, c, R, rot, spread, t=self.t)
+            self._draw_drone(overlay, c2, R2, rot, spread, t=self.t)
 
-        # blend with glow, applying fade
+        # blend, applying fade
         if fade < 1.0:
-            overlay = cv2.addWeighted(overlay, fade, np.zeros_like(frame), 0, 0)
-        sw, sh = max(1, w // 2), max(1, h // 2)
-        glow = cv2.GaussianBlur(cv2.resize(overlay, (sw, sh)), (0, 0), 1.3)
-        glow = cv2.resize(glow, (w, h), interpolation=cv2.INTER_LINEAR)
-        cv2.addWeighted(glow, 0.8, frame, 1.0, 0, frame)
-        cv2.addWeighted(overlay, 0.9, frame, 1.0, 0, frame)
+            overlay = cv2.addWeighted(overlay, fade, np.zeros_like(overlay), 0, 0)
+        bloom = cv2.resize(overlay, (w, h), interpolation=cv2.INTER_LINEAR)
+        cv2.addWeighted(bloom, 0.9, frame, 1.0, 0, frame)
 
     # -- kind 1: the Mark V web-shooter -------------------------------------- #
     def _draw_ws(self, overlay, c, R, rot, spread, t):
@@ -1142,16 +1149,17 @@ class BodyGear:
         live = [f for f in feats if f["landmarks"] is not None]
         if not live:
             return
-        overlay = np.zeros_like(frame)
+        # half-res overlay: the upscale doubles as the glow bloom
+        k = 0.5
+        w2, h2 = max(2, int(w * k)), max(2, int(h * k))
+        overlay = np.zeros((h2, w2, 3), np.uint8)
         for f in live:
-            self._gauntlet(overlay, f, w, h)
+            self._gauntlet(overlay, f, w2, h2)
         if len(live) >= 2:
-            self._chest(overlay, live, w, h)
-        sw, sh = max(1, w // 2), max(1, h // 2)
-        glow = cv2.GaussianBlur(cv2.resize(overlay, (sw, sh)), (0, 0), 1.4)
-        glow = cv2.resize(glow, (w, h), interpolation=cv2.INTER_LINEAR)
-        cv2.addWeighted(glow, 0.8, frame, 1.0, 0, frame)
-        cv2.addWeighted(overlay, 0.85, frame, 1.0, 0, frame)
+            self._chest(overlay, live, w2, h2)
+        overlay = cv2.GaussianBlur(overlay, (0, 0), 0.8)
+        bloom = cv2.resize(overlay, (w, h), interpolation=cv2.INTER_LINEAR)
+        cv2.addWeighted(bloom, 0.85, frame, 1.0, 0, frame)
 
     def _gauntlet(self, overlay, f, w, h):
         W = f["wrist"] * np.array([w, h])
@@ -1483,6 +1491,9 @@ def run(args: argparse.Namespace) -> int:
             # -- render ---------------------------------------------------------- #
             dt = max(0.0, t0 - last_frame_t)
             last_frame_t = t0
+            if gear is not None:            # gear under the wrist hardware
+                gear.update(dt)
+                gear.draw(frame, feats)
             if right_feat is not None:
                 draw_hand_holo(frame, right_feat["landmarks"])
             holo.update(dt, now, right_feat, frame.shape[1], frame.shape[0])
@@ -1492,9 +1503,6 @@ def run(args: argparse.Namespace) -> int:
                 blueprint.draw(frame)
                 if not blueprint.alive():
                     blueprint = None
-            if gear is not None:
-                gear.update(dt)
-                gear.draw(frame, feats)
 
             if recorder is not None:        # recording: red dot only, no text
                 cv2.circle(frame, (frame.shape[1] - 42, 30), 8, (0, 0, 255), -1)
