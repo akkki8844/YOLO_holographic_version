@@ -27,6 +27,10 @@ Gestures
                                                when it snaps READY the object
                                                follows your hand.  Let go and it
                                                simply stays where you left it.
+  D ........................................... live gesture readout (shows the
+                                               raw finger-curl / pinch numbers
+                                               so a stubborn gesture can be
+                                               seen, not guessed at)
   V ........................................... start / stop recording
   Esc / Q ..................................... quit
 
@@ -214,6 +218,24 @@ def curl_features(landmarks) -> dict:
     return curls
 
 
+FIST_CURL = 0.62          # a finger below this is folded
+FIST_MEAN = 0.60          # ...and the whole hand has to be closed on average
+
+
+def is_fist(curls: dict) -> bool:
+    """True when the four fingers are folded into the palm.
+
+    The THUMB is deliberately ignored.  In a natural fist it lies flat across
+    the folded fingers and stays almost straight (measured ~0.95 by the same
+    chain metric that reads 1.00 for a fully open hand), so testing it meant no
+    real fist was ever recognised.  One finger is allowed to disagree, since a
+    single mis-placed landmark should not cancel the gesture.
+    """
+    vals = [curls["index"], curls["middle"], curls["ring"], curls["pinky"]]
+    folded = sum(1 for v in vals if v < FIST_CURL)
+    return folded >= 3 and (sum(vals) / 4.0) < FIST_MEAN
+
+
 def hand_features(landmarks, is_right: bool) -> dict:
     """Everything the gesture engine + renderers need for one hand."""
     scale = hand_scale(landmarks) + 1e-6
@@ -221,16 +243,17 @@ def hand_features(landmarks, is_right: bool) -> dict:
     tt = _pt(landmarks, THUMB_TIP)
     it = _pt(landmarks, INDEX_TIP)
     mt = _pt(landmarks, MIDDLE_TIP)
-    pinches = (float(np.linalg.norm(tt - it)) + float(np.linalg.norm(tt - mt))) / 2.0
+    # closest of thumb->index / thumb->middle: pinching with two fingers is the
+    # natural gesture, and averaging the two (as this used to) meant a real
+    # pinch never got close to the threshold.
+    pinches = min(float(np.linalg.norm(tt - it)), float(np.linalg.norm(tt - mt)))
     tips = [_pt(landmarks, i) for i in (INDEX_TIP, MIDDLE_TIP, 12, 16, 20)]
     spread = float(np.mean([np.linalg.norm(tips[i] - tips[i + 1]) for i in range(4)]))
     return {
         "landmarks": landmarks,
         "is_right": bool(is_right),
         "curls": curls,
-        "fist": (curls["index"] < 0.55 and curls["middle"] < 0.55
-                 and curls["ring"] < 0.55 and curls["pinky"] < 0.55
-                 and curls["thumb"] < 0.88),
+        "fist": is_fist(curls),
         "open": (curls["index"] > 0.72 and curls["middle"] > 0.60
                  and curls["ring"] > 0.60),
         "pinch3": pinches / scale,          # thumb<->index/middle distance ratio
@@ -318,18 +341,21 @@ class GestureTracker:
     hiccup never cancels a gesture mid-way.
     """
 
-    FIST_HOLD = 0.45        # seconds one fist must be held
+    FIST_HOLD = 0.40        # seconds one fist must be held
     GEAR_HOLD = 1.00        # seconds BOTH fists must be held
-    GRAB_ON = 0.26          # pinch3 below this -> pinch begins
-    GRAB_OFF = 0.38         # pinch3 above this -> pinch ends
+    GRAB_ON = 0.30          # pinch3 below this -> pinch begins
+    GRAB_OFF = 0.46         # pinch3 above this -> pinch ends
+    PINCH_OPEN = 0.50       # index must be at least this straight to pinch
     PINCH_CONFIRM = 2       # frames of confirmation before a pinch edge
     GHOST_TTL = 0.35        # seconds a dropped hand keeps its state
-    PULL_DIST = 0.95        # pull distance, in hand-lengths
+    PULL_DIST = 0.75        # pull distance, in hand-lengths
     PULL_WINDOW = 2.5       # seconds a pinch stays eligible to become a pull
+    BOTH_GRACE = 0.30       # seconds a both-fist hold survives a tracking blip
 
     def __init__(self):
         self._slots: list = []
         self._both_fist_since: float | None = None
+        self._both_fist_last = -9.0
         self._gear_fired = False
 
     # -- public ------------------------------------------------------------- #
@@ -352,17 +378,20 @@ class GestureTracker:
 
         live = [s for s in self._slots if t - s["last_seen"] <= self.GHOST_TTL]
         fists = [s for s in live if s["fist"]]
-        # -- both fists -> the suit (fires while still held, no opening needed)
+        # -- both fists -> the suit (fires while still held, no opening needed).
+        # A blip that loses a hand for a frame or two must not restart the
+        # count, so the hold survives BOTH_GRACE seconds of missing fists.
         if len(fists) >= 2:
-            if self._both_fist_since is None:
+            if self._both_fist_since is None or t - self._both_fist_last > self.BOTH_GRACE:
                 self._both_fist_since = t
                 self._gear_fired = False
-            elif not self._gear_fired and t - self._both_fist_since >= self.GEAR_HOLD:
+            self._both_fist_last = t
+            if not self._gear_fired and t - self._both_fist_since >= self.GEAR_HOLD:
                 self._gear_fired = True
                 events.append(("gear", None))
                 for s in self._slots:        # consume the whole fist cycle
                     s["fist_fired"] = True
-        else:
+        elif t - self._both_fist_last > self.BOTH_GRACE:
             self._both_fist_since = None
             self._gear_fired = False
 
@@ -370,7 +399,9 @@ class GestureTracker:
             if s["matched"]:
                 self._pinch_edges(s, t, events)
         # -- one fist -> the blueprint --------------------------------------- #
-        if len(fists) == 1:
+        # ...but never while a both-fist hold is still inside its grace window,
+        # or losing one hand for a frame would spawn a stray blueprint.
+        if len(fists) == 1 and t - self._both_fist_last > self.BOTH_GRACE:
             s = fists[0]
             if s["fist_since"] is not None and not s["fist_fired"] \
                     and t - s["fist_since"] >= self.FIST_HOLD:
@@ -391,13 +422,19 @@ class GestureTracker:
             if s["pinch"] and not s["pulled"] and s["pinch_p0"] is not None:
                 d = float(np.linalg.norm(s["pinch_px"] - s["pinch_p0"]))
                 pull_p = clamp01(d / (self.PULL_DIST * max(s["scale"], 1e-3)))
+            c = s["curls"] or {}
             hands.append({
                 "side": "R" if s["is_right"] else "L",
                 "palm": (float(s["palm"][0]), float(s["palm"][1])),
                 "size": float(s["scale"]),
                 "pinch": bool(s["pinch"]),
+                "fist": bool(s["fist"]),
                 "fist_p": fist_p,
                 "pull_p": pull_p,
+                # raw numbers for the debug readout (D key)
+                "pinch3": float(s["pinch3"]),
+                "curls": [float(c.get(k, 0.0)) for k in
+                          ("index", "middle", "ring", "pinky", "thumb")],
             })
         gear_p = 0.0
         if self._both_fist_since is not None and not self._gear_fired:
@@ -423,7 +460,7 @@ class GestureTracker:
             "landmarks": h["landmarks"], "hand": h,
             "curls": None, "pinch3": 0.5, "spread": 0.5, "fist": False,
             "scale": 0.1, "matched": True, "last_seen": t,
-            "fist_since": None, "fist_fired": False,
+            "fist_since": None, "fist_fired": False, "pinch_ok": False,
             "pinch": False, "pinch_frames": 0,
             "pinch_px": h["palm"], "pinch_p0": None, "pinch_t0": 0.0,
             "pulled": False,
@@ -449,10 +486,11 @@ class GestureTracker:
         s["scale"] = float(np.linalg.norm(h["mcp9"] - h["wrist"])) or 0.1
         s["pinch_px"] = 0.5 * (h["thumb_tip"] + h["index_tip"])
         c = s["curls"]
-        fist = (c["index"] < 0.55 and c["middle"] < 0.55
-                and c["ring"] < 0.55 and c["pinky"] < 0.55
-                and c["thumb"] < 0.88)
+        fist = is_fist(c)
         s["fist"] = fist
+        # a closed fist also puts the thumb next to the fingertips, so without
+        # this gate every fist read as a pinch and pull-summoned a shooter
+        s["pinch_ok"] = (not fist) and c["index"] > self.PINCH_OPEN
         if not fist:                    # opening the hand re-arms the gesture
             s["fist_since"] = None
             s["fist_fired"] = False
@@ -460,7 +498,8 @@ class GestureTracker:
     def _pinch_edges(self, s, t, events):
         if s["fist"] and s["fist_since"] is None and not s["fist_fired"]:
             s["fist_since"] = t
-        p = s["pinch3"] < (self.GRAB_OFF if s["pinch"] else self.GRAB_ON)
+        p = s["pinch_ok"] and \
+            s["pinch3"] < (self.GRAB_OFF if s["pinch"] else self.GRAB_ON)
         # confirm quickly, let go quickly: the counter saturates low and drains
         # twice as fast, so releasing a grab never feels sticky
         s["pinch_frames"] = min(s["pinch_frames"] + 1, 4) if p \
@@ -501,6 +540,7 @@ class HoloDesk:
         self.suit = None
         self.drags: dict = {"Right": None, "Left": None}
         self.hud = Hud()
+        self.debug = False
         self._log = log
 
     # -- helpers ------------------------------------------------------------- #
@@ -542,8 +582,9 @@ class HoloDesk:
         if d is not None and d["obj"] is not None:
             return                                  # this pinch is a grab, not a pull
         target = "Left" if feat["is_right"] else "Right"
-        # the mirrored preview keeps your left hand on the left of the screen
-        park = (0.24 * w if target == "Left" else 0.76 * w, 0.46 * h)
+        # If that wrist is off-camera the shooter waits at the edge of the
+        # frame on its own side - never floating in the middle of the view.
+        park = (0.11 * w if target == "Left" else 0.89 * w, 0.34 * h)
         sh = self.shooters[target]
         what = sh.toggle(t, pinch_px(feat, w, h), park)
         self._log(f"[gesture] pinch-pull {side} -> {target} wrist shooter {what}")
@@ -666,12 +707,21 @@ class HoloDesk:
         # the bilinear upscale from half-res IS the bloom - no blur pass needed
         bloom = cv2.resize(ov, (w, h), interpolation=cv2.INTER_LINEAR)
         cv2.addWeighted(bloom, 0.72, frame, 1.0, 0, frame)
+        # the wrist shooters are small, so they get a crisp full-resolution
+        # pass of their own once the bloom is down
+        for side in ("Right", "Left"):
+            self.shooters[side].draw_sharp(frame, t)
+        if self.suit is not None:
+            self.suit.draw_sharp(frame, t, feats)
         if self.blueprint is not None:
             self.blueprint.annotate(frame, t)
         state = tracker.hud_state(t)
         self.hud.draw(frame, {"t": t, "fps": fps, "hand_count": len(feats),
                               "hands": state["hands"], "gear_p": state["gear_p"],
-                              "drags": self.drag_hud(t), "chips": self.chips(t)})
+                              "drags": self.drag_hud(t), "chips": self.chips(t),
+                              "debug": self.debug,
+                              "thresholds": {"grab_on": GestureTracker.GRAB_ON,
+                                             "fist_curl": FIST_CURL}})
 
 
 # --------------------------------------------------------------------------- #
@@ -868,6 +918,7 @@ def run(args: argparse.Namespace) -> int:
 
     tracker = GestureTracker()
     desk = HoloDesk()
+    desk.debug = bool(args.debug)
     t_start = time.monotonic()
     vcam = None
     vcam_enabled = bool(args.virtualcam)
@@ -987,6 +1038,8 @@ def run(args: argparse.Namespace) -> int:
                     break
                 elif key in (ord("v"), ord("V")):
                     toggle_record()
+                elif key in (ord("d"), ord("D")):
+                    desk.debug = not desk.debug
 
             if args.record and recorder is None and kind != "image":
                 toggle_record()     # auto-start recording from launch
@@ -1015,14 +1068,21 @@ def run(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 # Self-test (headless; used to validate installs and regressions)
 # --------------------------------------------------------------------------- #
-def _fake_feat(is_right=True, fist=False, pinch3=0.60, hand_id=0.0, dx=0.0, dy=0.0):
-    """Synthetic feature dict for deterministic gesture-engine tests."""
+def _fake_feat(is_right=True, fist=False, pinch3=None, hand_id=0.0, dx=0.0, dy=0.0):
+    """Synthetic feature dict for deterministic gesture-engine tests.
+
+    The fist is modelled the way a real one measures: fingers folded but the
+    THUMB nearly straight across them (~0.95), and the thumb tip therefore
+    sitting right next to the fingertips (a low pinch distance).
+    """
     if fist:
-        curls = dict(thumb=0.35, index=0.2, middle=0.2, ring=0.2, pinky=0.2)
+        curls = dict(thumb=0.95, index=0.2, middle=0.2, ring=0.2, pinky=0.2)
         spread = 0.30
     else:
         curls = dict(thumb=0.9, index=0.95, middle=0.9, ring=0.9, pinky=0.9)
         spread = 0.75
+    if pinch3 is None:
+        pinch3 = 0.15 if fist else 0.60
     x = 0.3 + hand_id + dx
     y = dy
     return {
@@ -1105,11 +1165,14 @@ def selftest(args: argparse.Namespace) -> int:
     assert sh.state == "on", f"shooter must land on the wrist (got {sh.state})"
     half = np.zeros((240, 320, 3), np.uint8)
     sh.draw(half, 0.5, 1.0)
-    assert half.any(), "mounted shooter must draw"
-    wx, wy = right["wrist"] * np.array([320, 240])
-    near = half[max(0, int(wy - 60)):int(wy + 60), max(0, int(wx - 60)):int(wx + 60)]
-    assert near.size and int((near.sum(axis=2) > 120).sum()) > 30, \
-        "the shooter must sit on the wrist"
+    assert half.any(), "mounted shooter must draw its glow into the overlay"
+    full = np.zeros((480, 640, 3), np.uint8)
+    sh.draw_sharp(full, 1.0)          # the crisp full-resolution pass
+    wx, wy = right["wrist"] * np.array([640, 480])
+    near = full[max(0, int(wy - 120)):int(wy + 120), max(0, int(wx - 120)):int(wx + 120)]
+    assert near.size and int((near.sum(axis=2) > 120).sum()) > 200, \
+        "the shooter must sit on the wrist, at full resolution"
+    assert full[:, :, 0].sum() > full[:, :, 2].sum(), "the shooter must stay blue"
     sh.dismiss(1.0)
     for i in range(20):
         sh.update(1 / 30.0, 1.0 + i / 30.0, right, 640, 480)
@@ -1176,12 +1239,25 @@ def selftest(args: argparse.Namespace) -> int:
     print("[ok] tracker: pinch+pull summons once, a still pinch does not")
 
     # 9. tracker: one fist -> blueprint, both fists 1 s -> suit (no blueprint)
+    assert is_fist(dict(thumb=0.95, index=0.3, middle=0.3, ring=0.35, pinky=0.4)), \
+        "a real fist keeps the thumb straight across the fingers - it must count"
+    assert not is_fist(dict(thumb=1.0, index=0.99, middle=0.99, ring=0.99, pinky=0.99)), \
+        "an open hand is not a fist"
     tr3 = GestureTracker()
     evs = []
     for i in range(24):
         evs += tr3.feed([_fake_feat(True, fist=True)], i / 30.0)
     fists = [e for e in evs if e[0] == "fist"]
     assert len(fists) == 1, f"one fist must fire once per cycle (got {len(fists)})"
+    # a fist puts the thumb on the fingertips: it must never read as a pinch,
+    # and a fist swung across the frame must never summon a shooter
+    assert not [e for e in evs if e[0] in ("pinch", "pull")], \
+        "a fist must not register as a pinch"
+    tr3b = GestureTracker()
+    evs = []
+    for i in range(24):
+        evs += tr3b.feed([_fake_feat(True, fist=True, dx=0.03 * i)], i / 30.0)
+    assert not [e for e in evs if e[0] == "pull"], "a moving fist must not summon"
     tr4 = GestureTracker()
     evs = []
     for i in range(40):
@@ -1293,6 +1369,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="run without the preview window (headless)")
     p.add_argument("--verbose", action="store_true",
                    help="log tracking status to the console")
+    p.add_argument("--debug", action="store_true",
+                   help="show the live gesture readout (also toggled with D)")
     p.add_argument("--virtualcam", action="store_true",
                    help="broadcast the preview to a Windows virtual camera "
                         "so video calls (WhatsApp, Teams, Zoom) see the hologram")

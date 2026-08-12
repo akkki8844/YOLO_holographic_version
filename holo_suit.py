@@ -19,7 +19,7 @@ import numpy as np
 
 import holo_models as MODELS
 from holo3d import (HOLO_BLUE, HOLO_CYAN, HOLO_WHITE, clamp01, dim, project,
-                    render_mesh, rot_matrix, smoothstep)
+                    render_glow, render_mesh, rot_matrix, smoothstep)
 from holo_objects import hand_frame, _mount_rot
 
 
@@ -46,22 +46,31 @@ class SuitGear:
 
     # -- anchoring ----------------------------------------------------------- #
     def _resolve(self, feats, w: int, h: int):
+        """Where the torso sits.  Deliberately sluggish: the suit is worn, so
+        it must sit still on the body while the hands move freely.
+
+        Hands only *suggest* the anchor - the body is assumed to be centred in
+        frame with the chest low, and the hand midpoint is allowed to lean it
+        a little.  Once resolved, the anchor is kept even when both hands leave
+        the frame, so the suit never blinks out mid-pose.
+        """
         frames = [fr for fr in (hand_frame(f, w, h) for f in feats) if fr is not None]
         if not frames:
-            return None, []
+            return self._anchor, []          # hands gone: keep wearing the suit
         lens = float(np.mean([fr["L"] for fr in frames]))
         mx = float(np.mean([fr["W"][0] for fr in frames]))
         my = float(np.mean([fr["W"][1] for fr in frames]))
-        cx = 0.5 * w + (mx - 0.5 * w) * 0.35
-        cy = min(0.92 * h, max(0.42 * h, my + 2.1 * lens))
-        sc = max(60.0, min(0.30 * h, 3.1 * lens))
+        cx = 0.5 * w + (mx - 0.5 * w) * 0.20
+        cy = min(0.95 * h, max(0.55 * h, my + 2.3 * lens))
+        sc = max(70.0, min(0.34 * h, 2.9 * lens))
         if self._anchor is None:
             self._anchor = [cx, cy, sc]
         else:
-            a = 0.10
-            self._anchor[0] += (cx - self._anchor[0]) * a
-            self._anchor[1] += (cy - self._anchor[1]) * a
-            self._anchor[2] += (sc - self._anchor[2]) * a
+            a = 0.06
+            for i, tgt in enumerate((cx, cy, sc)):
+                d = tgt - self._anchor[i]
+                if abs(d) > 3.0:             # deadband kills landmark jitter
+                    self._anchor[i] += d * a
         return self._anchor, frames
 
     def _fade(self) -> float:
@@ -70,6 +79,35 @@ class SuitGear:
         return 1.0 - clamp01((self.t - self.dying) / 0.55)
 
     # -- render -------------------------------------------------------------- #
+    def _build(self) -> float:
+        return 1.0 if self.dying is not None else clamp01(self.t / self.BUILD)
+
+    def draw_sharp(self, frame, t: float, feats) -> None:
+        """Wrist gauntlets at full resolution, after the overlay composite.
+
+        Same reason as the web-shooters: at half resolution a forearm-sized
+        model is only a few dozen pixels wide and loses all of its plating.
+        """
+        fade = self._fade()
+        if fade <= 0.02:
+            return
+        h, w = frame.shape[:2]
+        alpha = fade * (0.92 + 0.08 * math.sin(self.t * 17.0) * math.sin(self.t * 5.3))
+        build = self._build()
+        for f in feats:
+            fr = hand_frame(f, w, h)
+            if fr is None:
+                continue
+            arm = {"theta": math.atan2(-fr["ax"][1], -fr["ax"][0]),
+                   "side": fr["side"], "L": fr["L"]}
+            rot = _mount_rot(arm, wobble=0.04 * math.sin(self.t * 1.4))
+            c = (fr["W"][0] - fr["ax"][0] * 0.12 * fr["L"],
+                 fr["W"][1] - fr["ax"][1] * 0.12 * fr["L"])
+            render_glow(frame, MODELS.gauntlet_mesh(), c, 0.52 * fr["L"], rot,
+                        alpha=alpha * (0.4 + 0.6 * build),
+                        wire=(1.0 - smoothstep(build)) * 0.85, cull=True,
+                        gain=0.90, glow=0.5)
+
     def draw(self, ov, k: float, t: float, feats) -> None:
         anchor, frames = self._resolve(feats, int(ov.shape[1] / k), int(ov.shape[0] / k))
         if anchor is None:
@@ -77,9 +115,7 @@ class SuitGear:
         fade = self._fade()
         if fade <= 0.02:
             return
-        build = clamp01(self.t / self.BUILD)
-        if self.dying is not None:
-            build = 1.0
+        build = self._build()
         cx, cy, sc = anchor
         c = (cx * k, cy * k)
         s = sc * k
@@ -116,17 +152,13 @@ class SuitGear:
         cv2.line(ov, (x0, int(y) + 3), (x1, int(y) + 3), dim(HOLO_CYAN, 0.4 * alpha), 1)
 
     def _gauntlet(self, ov, fr, k: float, build: float, alpha: float) -> None:
-        arm = {"theta": math.atan2(-fr["ax"][1], -fr["ax"][0]),
-               "side": fr["side"], "L": fr["L"]}
-        rot = _mount_rot(arm, wobble=0.04 * math.sin(self.t * 1.4))
+        """The wrist's materialise ring (the armour itself is drawn sharp)."""
+        if build >= 1.0:
+            return
         c = ((fr["W"][0] - fr["ax"][0] * 0.12 * fr["L"]) * k,
              (fr["W"][1] - fr["ax"][1] * 0.12 * fr["L"]) * k)
         s = 0.52 * fr["L"] * k
-        render_mesh(ov, MODELS.gauntlet_mesh(), c, s, rot,
-                    alpha=alpha * (0.4 + 0.6 * build),
-                    wire=(1.0 - smoothstep(build)) * 0.85, cull=True)
-        if build < 1.0:                       # materialise ring at the wrist
-            rr = (0.7 + 2.0 * build) * s
-            cv2.ellipse(ov, (int(c[0]), int(c[1])), (int(rr), int(rr * 0.42)),
-                        math.degrees(arm["theta"]), 0, 360,
-                        dim(HOLO_CYAN, alpha * (1.0 - build)), 2, cv2.LINE_AA)
+        rr = (0.7 + 2.0 * build) * s
+        cv2.ellipse(ov, (int(c[0]), int(c[1])), (int(rr), int(rr * 0.42)),
+                    math.degrees(math.atan2(-fr["ax"][1], -fr["ax"][0])), 0, 360,
+                    dim(HOLO_CYAN, alpha * (1.0 - build)), 2, cv2.LINE_AA)

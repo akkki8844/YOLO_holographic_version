@@ -19,8 +19,8 @@ import numpy as np
 
 import holo_models as MODELS
 from holo3d import (HOLO_BLUE, HOLO_CYAN, HOLO_DEEP, HOLO_DIM, HOLO_WHITE,
-                    FLIP_X, clamp01, dim, ease_out_back, project, render_mesh,
-                    rot_matrix, smoothstep)
+                    FLIP_X, clamp01, dim, ease_out_back, project, render_glow,
+                    render_mesh, rot_matrix, smoothstep)
 
 
 def hand_frame(feat, w: int, h: int):
@@ -90,7 +90,6 @@ class WebShooter:
         self._lock = -9.0
         self._drag_off = (0.0, 0.0)
         self._fr = None
-        self._aim = None
 
     # -- lifecycle ---------------------------------------------------------- #
     def active(self) -> bool:
@@ -148,10 +147,10 @@ class WebShooter:
         self._fr = fr
         self.spin += dt
         if fr is not None:
-            anchor = (fr["W"][0] + fr["ax"][0] * 0.30 * fr["L"],
-                      fr["W"][1] + fr["ax"][1] * 0.30 * fr["L"])
-            live_scale = 0.50 * fr["L"]
-            self._aim = (feat["index_tip"] * np.array([w, h])).tolist()
+            # band just behind the wrist, spinneret just past the knuckles
+            anchor = (fr["W"][0] + fr["ax"][0] * 0.26 * fr["L"],
+                      fr["W"][1] + fr["ax"][1] * 0.26 * fr["L"])
+            live_scale = 0.56 * fr["L"]
         else:
             anchor, live_scale = None, None
 
@@ -203,13 +202,9 @@ class WebShooter:
                 self.pos = None
 
     # -- render ------------------------------------------------------------- #
-    def draw(self, ov, k: float, t: float) -> None:
-        if self.pos is None or self.state == "off" or self.scale < 4.0:
-            return
-        c = (self.pos[0] * k, self.pos[1] * k)
-        s = self.scale * k
-        alpha = 1.0
-        wire = 0.0
+    def _shading(self, t: float):
+        """(alpha, wire, hot) for the current state."""
+        alpha, wire = 1.0, 0.0
         if self.state == "arrive":
             f = clamp01((t - self.t0) / self.ARRIVE)
             wire = 1.0 - smoothstep(f)          # wireframe -> solid as it lands
@@ -218,16 +213,33 @@ class WebShooter:
             f = clamp01((t - self.t0) / self.DISMISS)
             alpha = 1.0 - f
             wire = f
-        flick = 0.93 + 0.07 * math.sin(t * 19.0) * math.sin(t * 6.1)
+        alpha *= 0.93 + 0.07 * math.sin(t * 19.0) * math.sin(t * 6.1)
         hot = 0.0
         if t - self._flash < 0.45:
             hot = 0.9 * (1.0 - (t - self._flash) / 0.45)
         if t - self._lock < 0.5:
             hot = max(hot, 1.1 * (1.0 - (t - self._lock) / 0.5))
-        lod = 1 if s > 64.0 else 0          # the small wrist model drops detail
-        render_mesh(ov, MODELS.shooter_mesh(lod), c, s, self.rot,
-                    alpha=alpha * flick, wire=wire, hot=hot, cull=True)
-        self._fx(ov, k, t, c, s)
+        return alpha, wire, hot
+
+    def draw(self, ov, k: float, t: float) -> None:
+        """Glow, rings and motes into the shared half-res overlay."""
+        if self.pos is None or self.state == "off" or self.scale < 4.0:
+            return
+        self._fx(ov, k, t, (self.pos[0] * k, self.pos[1] * k), self.scale * k)
+
+    def draw_sharp(self, frame, t: float) -> None:
+        """The shooter itself, at full resolution, after the overlay composite.
+
+        A wrist-worn model is only ~55 px wide in the half-res overlay, where
+        its panel lines collapse into a blue smudge.  Rendering it into a small
+        full-res ROI keeps every rib, vent and cartridge readable.
+        """
+        if self.pos is None or self.state == "off" or self.scale < 4.0:
+            return
+        alpha, wire, hot = self._shading(t)
+        render_glow(frame, MODELS.shooter_mesh(1), self.pos, self.scale, self.rot,
+                    alpha=alpha, wire=wire, hot=hot, cull=True,
+                    gain=0.92, glow=0.5)
 
     def _fx(self, ov, k: float, t: float, c, s: float) -> None:
         if t - self._flash < 0.55:               # materialise ripple
@@ -241,14 +253,19 @@ class WebShooter:
                 my = c[1] + math.sin(a) * s * 0.65
                 cv2.circle(ov, (int(mx), int(my)), 2,
                            dim(HOLO_CYAN, 0.4 + 0.5 * math.sin(t * 4.0 + i)), -1)
-        if self.state == "on" and self._fr is not None and self._aim is not None:
-            nozzle = project(np.array([[1.35, 0.99, 0.0]]), c, s, self.rot)[0]
-            tip = (self._aim[0] * k, self._aim[1] * k)
-            glow = 0.30 + 0.35 * (0.5 + 0.5 * math.sin(t * 3.0))
-            cv2.line(ov, (int(nozzle[0]), int(nozzle[1])), (int(tip[0]), int(tip[1])),
-                     dim(HOLO_CYAN, glow), 1, cv2.LINE_AA)
-            cv2.circle(ov, (int(nozzle[0]), int(nozzle[1])), max(2, int(0.10 * s)),
-                       dim(HOLO_WHITE, 0.55), 1, cv2.LINE_AA)
+        if self.state == "on" and self._fr is not None:
+            # strap glow around the wrist band, so it reads as WORN rather
+            # than as an object floating near the arm
+            band = project(np.array([[-0.58, 0.0, 0.0]]), c, s, self.rot)[0]
+            _ring(ov, band, s * 0.92, dim(HOLO_BLUE, 0.45), 1,
+                  squash=0.80, ang=self._fr["theta"] + math.pi / 2.0)
+            # muzzle bloom at the spinneret
+            nozzle = project(np.array([[1.36, 0.99, 0.0]]), c, s, self.rot)[0]
+            pulse = 0.45 + 0.30 * (0.5 + 0.5 * math.sin(t * 3.4))
+            cv2.circle(ov, (int(nozzle[0]), int(nozzle[1])), max(2, int(0.13 * s)),
+                       dim(HOLO_CYAN, pulse * 0.7), 1, cv2.LINE_AA)
+            cv2.circle(ov, (int(nozzle[0]), int(nozzle[1])), max(1, int(0.05 * s)),
+                       dim(HOLO_WHITE, pulse), -1, cv2.LINE_AA)
 
 
 # --------------------------------------------------------------------------- #

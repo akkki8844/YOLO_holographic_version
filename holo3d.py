@@ -330,3 +330,42 @@ def render_mesh(dst, mesh: Mesh, centre, scale: float, rot: np.ndarray, *,
         roi = dst[by0:by1:3, bx0:bx1]
         dst[by0:by1:3, bx0:bx1] = (roi * 0.52).astype(np.uint8)
     return (bx0, by0, bx1, by1)
+
+
+def screen_radius(mesh: Mesh, scale: float) -> float:
+    """Worst-case pixel radius of a mesh at this scale (for ROI sizing)."""
+    r = mesh.radius
+    return scale * r * (DEPTH * FOCAL / max(DEPTH - r, 0.5))
+
+
+def render_glow(dst, mesh: Mesh, centre, scale: float, rot: np.ndarray, *,
+                gain: float = 0.95, glow: float = 0.55, **kw):
+    """Render a mesh at FULL resolution into a small scratch ROI, then add it.
+
+    Half-resolution rendering is right for the big objects, but a wrist-worn
+    model only covers ~55 px there and dissolves into mush.  The scratch buffer
+    is just the object's bounding box, so full-res detail costs very little,
+    and a blurred copy of the same buffer supplies the bloom that the half-res
+    upscale would otherwise have provided.
+    """
+    if mesh.V is None or scale <= 0.5 or not np.isfinite(centre).all():
+        return None
+    hh, ww = dst.shape[:2]
+    r = screen_radius(mesh, scale) + 8.0
+    if not math.isfinite(r) or r > max(ww, hh) * 2.0:
+        return None
+    x0 = int(max(0, math.floor(centre[0] - r)))
+    x1 = int(min(ww, math.ceil(centre[0] + r)))
+    y0 = int(max(0, math.floor(centre[1] - r)))
+    y1 = int(min(hh, math.ceil(centre[1] + r)))
+    if x1 - x0 < 6 or y1 - y0 < 6:
+        return None
+    buf = np.zeros((y1 - y0, x1 - x0, 3), np.uint8)
+    box = render_mesh(buf, mesh, (centre[0] - x0, centre[1] - y0), scale, rot, **kw)
+    if box is None:
+        return None
+    roi = dst[y0:y1, x0:x1]
+    if glow > 0.01:
+        cv2.addWeighted(cv2.blur(buf, (11, 11)), glow, roi, 1.0, 0, roi)
+    cv2.addWeighted(buf, gain, roi, 1.0, 0, roi)
+    return (x0, y0, x1, y1)

@@ -62,6 +62,8 @@ class Hud:
         self._bottom(ov, w, h, t, ctx)
         self._hands(ov, w, h, t, ctx)
         self._drags(ov, t, ctx)
+        if ctx.get("debug"):
+            self._debug(ov, w, h, ctx)
         self._scanline(ov, w, h, t)
 
     # -- pieces -------------------------------------------------------------- #
@@ -75,16 +77,9 @@ class Hud:
             cv2.line(ov, (x, y), (x, y + sy * L), col, 2, cv2.LINE_AA)
             cv2.line(ov, (x + sx * 8, y + sy * 8), (x + sx * 34, y + sy * 8),
                      dim(HOLO_CYAN, 0.5), 1, cv2.LINE_AA)
-        # centre reticle ticks + horizon
-        cx, cy = w // 2, h // 2
-        for sx in (-1, 1):
-            cv2.line(ov, (cx + sx * 26, cy), (cx + sx * 54, cy), dim(HOLO_BLUE, 0.55), 1)
-            cv2.line(ov, (cx, cy + sx * 26), (cx, cy + sx * 40), dim(HOLO_BLUE, 0.4), 1)
-        cv2.circle(ov, (cx, cy), 3, dim(HOLO_CYAN, 0.6), 1, cv2.LINE_AA)
-        for i in range(-4, 5):                       # horizon ladder
-            x = cx + i * 60
-            if 0 < x < w:
-                cv2.line(ov, (x, cy - 4), (x, cy + 4), dim(HOLO_DIM, 0.8), 1)
+        # nothing is drawn across the middle of the frame: that is where the
+        # user's face and the holograms live, and furniture there just reads
+        # as clutter
 
     def _top_bar(self, ov, w, h, t, ctx):
         col = dim(HOLO_CYAN, 0.95)
@@ -245,6 +240,42 @@ class Hud:
                            cv2.LINE_AA)
                 text(ov, "MOVE LOCK", (px - r, py - r - 10), 0.38,
                      dim(HOLO_WHITE, 0.95))
+
+    def _debug(self, ov, w, h, ctx):
+        """Raw gesture numbers, so a gesture that will not fire can be seen.
+
+        Green is never used (blue only): a satisfied test is drawn hot white,
+        an unsatisfied one stays dim blue.
+        """
+        th = ctx.get("thresholds", {})
+        grab_on = float(th.get("grab_on", 0.30))
+        fist_curl = float(th.get("fist_curl", 0.62))
+        x, y = 28, int(h * 0.60)
+        text(ov, "GESTURE DEBUG  [D]", (x, y), 0.38, dim(HOLO_WHITE, 0.95))
+        text(ov, f"fist: finger curl < {fist_curl:.2f}   pinch: dist < {grab_on:.2f}",
+             (x, y + 16), 0.32, dim(HOLO_BLUE, 0.9))
+        y += 38
+        if not ctx.get("hands"):
+            text(ov, "no hands tracked", (x, y), 0.34, dim(HOLO_DEEP, 0.95))
+            return
+        for hnd in ctx.get("hands", []):
+            curls = hnd.get("curls", [])
+            text(ov, f"{hnd['side']}  I M R P T", (x, y), 0.34, dim(HOLO_CYAN, 0.95))
+            for i, v in enumerate(curls):
+                lit = v < fist_curl and i < 4
+                text(ov, f"{v:.2f}", (x + 54 + i * 40, y), 0.34,
+                     dim(HOLO_WHITE if lit else HOLO_BLUE, 0.95))
+            pd = hnd.get("pinch3", 1.0)
+            text(ov, f"pinch {pd:.2f}", (x + 224, y), 0.34,
+                 dim(HOLO_WHITE if pd < grab_on else HOLO_BLUE, 0.95))
+            flags = []
+            if hnd.get("fist"):
+                flags.append("FIST")
+            if hnd.get("pinch"):
+                flags.append("PINCH")
+            text(ov, " ".join(flags) or "-", (x + 320, y), 0.34,
+                 dim(HOLO_WHITE if flags else HOLO_DEEP, 0.95))
+            y += 22
 
     def _scanline(self, ov, w, h, t):
         """A soft blue band sweeping down the frame - blended, never opaque."""
