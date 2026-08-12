@@ -1543,6 +1543,29 @@ def run(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 # Self-test (headless; used to validate installs and regressions)
 # --------------------------------------------------------------------------- #
+def _fake_feat(is_right=True, fist=False, pinch3=0.60, hand_id=0.0):
+    """Synthetic feature dict for deterministic gesture-engine tests."""
+    if fist:
+        curls = dict(thumb=0.35, index=0.2, middle=0.2, ring=0.2, pinky=0.2)
+        spread = 0.30
+    else:
+        curls = dict(thumb=0.9, index=0.95, middle=0.9, ring=0.9, pinky=0.9)
+        spread = 0.75
+    x = 0.3 + hand_id
+    return {
+        "landmarks": None, "is_right": bool(is_right), "curls": curls,
+        "fist": fist, "open": not fist, "pinch3": pinch3, "spread": spread,
+        "palm": np.array([x, 0.50]), "wrist": np.array([x, 0.75]),
+        "mcp9": np.array([x, 0.62]), "index_tip": np.array([x, 0.44]),
+        "middle_tip": np.array([x + 0.05, 0.44]),
+        "thumb_tip": np.array([x, 0.55]),
+    }
+
+
+def _feat_from_landmarks(landmarks, is_right):
+    return hand_features(landmarks, is_right)
+
+
 def selftest(args: argparse.Namespace) -> int:
     print("== hologram studio selftest ==")
     ensure_model()
@@ -1568,17 +1591,151 @@ def selftest(args: argparse.Namespace) -> int:
     # 2. classify_hands labels every hand and picks the right one
     feats = classify_hands(res)
     assert feats, "classify_hands must return per-hand features"
-    assert any(f["is_right"] for f in feats), "exactly the RIGHT hand must be flagged"
+    rights = [f for f in feats if f["is_right"]]
+    assert rights, "exactly the RIGHT hand must be flagged"
+    right = rights[0]
     print(f"[ok] classified {len(feats)} hand(s), right-hand picked")
 
-    # 3. skeleton overlay draws without crashing
+    # 3. hologram renders over time (update+draw) and tolerates no hand
+    holo = WebShooterHologram()
+    for t in (0.0, 0.37, 1.9, 5.0, 12.5):
+        f = np.zeros((480, 640, 3), np.uint8)
+        holo.update(1 / 30.0, t, right, 640, 480)
+        holo.draw(f, t)
+        assert f.any(), f"hologram drew nothing at t={t:.2f}"
     f = np.zeros((480, 640, 3), np.uint8)
-    right = next(f2 for f2 in feats if f2["is_right"])
-    draw_hand_holo(f, right["landmarks"])
-    assert f.any(), "skeleton overlay must draw pixels"
-    print("[ok] hand skeleton overlay renders")
+    holo.update(1 / 30.0, 3.0, None, 640, 480)   # no hand: no crash, no draw
+    holo.draw(f, 3.0)
+    print("[ok] hologram renders across time (5 frames) and tolerates no hand")
 
-    # 4. preview video recorder
+    # 4. anchored at the wrist: bright pixels near the wrist landmark
+    f = np.zeros((480, 640, 3), np.uint8)
+    holo.update(1 / 30.0, 0.8, right, 640, 480)
+    holo.draw(f, 0.8)
+    wx, wy = right["wrist"] * np.array([640, 480])
+    R = 0.52 * float(np.linalg.norm((right["mcp9"] - right["wrist"]) * np.array([640, 480])))
+    x0, x1 = max(0, int(wx - 1.6 * R)), min(640, int(wx + 1.6 * R))
+    y0, y1 = max(0, int(wy - 1.6 * R)), min(480, int(wy + 1.6 * R))
+    region = f[y0:y1, x0:x1]
+    assert region.size and int((region.sum(axis=2) > 140).sum()) > 40, \
+        "hologram must draw bright pixels around the wrist"
+    print("[ok] hologram is anchored at the wrist (bright pixels nearby)")
+
+    # 5. hologram scales with hand size (shrunk hand still draws)
+    L0 = float(np.linalg.norm((right["mcp9"] - right["wrist"]) * np.array([640, 480])))
+    if L0 >= 24:
+        f = np.zeros((480, 640, 3), np.uint8)
+        tiny = dict(right)
+        for k in ("wrist", "mcp9", "index_tip", "middle_tip", "thumb_tip", "palm"):
+            tiny[k] = right["wrist"] + (right[k] - right["wrist"]) * 0.5
+        holo.update(1 / 30.0, 2.0, tiny, 640, 480)
+        holo.draw(f, 2.0)
+        assert f.any(), "shrunk hand must still render the hologram"
+        print("[ok] hologram scales with hand size")
+    else:
+        print("[ok] hologram scaling check skipped (sample hand too small)")
+
+    # 6. gesture tracker: single fist hold -> open fires ONE spawn per cycle
+    #    (features are EMA-smoothed, so the event lands ~2 frames after open)
+    tr = GestureTracker()
+    tr.feed([_fake_feat(True, fist=True)], 0.0)
+    tr.feed([_fake_feat(True, fist=True)], 0.40)
+    tr.feed([_fake_feat(True)], 0.50)        # hand starts opening
+    evs = tr.feed([_fake_feat(True)], 0.53)  # smoothed out of fist -> spawn
+    assert [e for e in evs if e[0] == "spawn"], "fist->open must spawn a blueprint"
+    evs = tr.feed([_fake_feat(True)], 0.57)
+    evs = tr.feed([_fake_feat(True)], 0.60)
+    assert not [e for e in evs if e[0] == "spawn"], "spawn must fire only once"
+    for i in range(16):                        # second fist cycle (held longer,
+        tr.feed([_fake_feat(True, fist=True)], 0.9 + i / 30.0)  # EMA re-register)
+    tr.feed([_fake_feat(True)], 1.45)
+    evs = tr.feed([_fake_feat(True)], 1.48)
+    assert [e for e in evs if e[0] == "spawn"], "spawn must work again next cycle"
+    tr2 = GestureTracker()
+    tr2.feed([_fake_feat(True, fist=True)], 0.0)
+    evs = tr2.feed([_fake_feat(True)], 0.30)       # held too briefly
+    assert not [e for e in evs if e[0] == "spawn"], "short fist must not spawn"
+    print("[ok] tracker: fist->open spawns once per cycle, short fists ignored")
+
+    # 7. tracker: both fists held -> open fires GEAR and consumes the cycle
+    tr3 = GestureTracker()
+    two = lambda fist, t: tr3.feed(  # noqa: E731
+        [_fake_feat(True, fist=fist), _fake_feat(False, fist=fist, hand_id=0.35)], t)
+    two(True, 0.0)
+    two(True, 0.35)
+    two(True, 0.65)
+    two(False, 0.70)          # hands start opening
+    evs = two(False, 0.73)    # smoothed out of both fists -> gear
+    gear_ev = [e for e in evs if e[0] == "gear"]
+    assert gear_ev, "both-fists hold must fire the gear event"
+    assert not [e for e in evs if e[0] == "spawn"], \
+        "gear must suppress spawn for the opening hand"
+    print("[ok] tracker: both-fists hold -> gear, spawn suppressed")
+
+    # 8. tracker: right-hand pinch -> grab / release; left hand stays silent
+    tr4 = GestureTracker()
+    tr4.feed([_fake_feat(True, pinch3=0.10)], 0.0)
+    evs = tr4.feed([_fake_feat(True, pinch3=0.10)], 1 / 30)   # 2nd confirm frame
+    assert [e for e in evs if e[0] == "grab"], "right-hand pinch must grab"
+    tr4.feed([_fake_feat(True, pinch3=0.5)], 3 / 30)
+    evs = tr4.feed([_fake_feat(True, pinch3=0.5)], 4 / 30)   # hysteresis crossing
+    assert [e for e in evs if e[0] == "release"], "pinch release must fire"
+    tr5 = GestureTracker()
+    tr5.feed([_fake_feat(False, pinch3=0.10, hand_id=0.4)], 0.0)
+    tr5.feed([_fake_feat(False, pinch3=0.10, hand_id=0.4)], 1 / 30)
+    tr5.feed([_fake_feat(False, pinch3=0.10, hand_id=0.4)], 2 / 30)
+    evs = tr5.feed([_fake_feat(False, pinch3=0.10, hand_id=0.4)], 3 / 30)
+    assert not [e for e in evs if e[0] == "grab"], "left-hand pinch must not grab"
+    print("[ok] tracker: pinch grab/release on the right hand only")
+
+    # 9. hologram lifecycle: on -> detach -> held -> float -> reattach -> on
+    f = np.zeros((480, 640, 3), np.uint8)
+    holo.update(1 / 30.0, 1.0, right, 640, 480)
+    holo.grab(right, 640, 480, 1.0)
+    assert holo.state == "detach"
+    for i in range(20):
+        holo.update(1 / 30.0, 1.0 + i / 30.0, right, 640, 480)
+        holo.draw(f, 1.0 + i / 30.0)
+    assert holo.state == "held", "detach animation must finish in 'held'"
+    holo.release(None, 640, 480, 1.7)
+    assert holo.state == "float"
+    holo.update(1 / 30.0, 1.75, None, 640, 480)
+    holo.draw(f, 1.75)
+    holo.grab(right, 640, 480, 1.8)
+    assert holo.state == "reattach"
+    for i in range(15):
+        holo.update(1 / 30.0, 1.8 + i / 30.0, right, 640, 480)
+        holo.draw(f, 1.8 + i / 30.0)
+    assert holo.state == "on", "reattach must finish back on the wrist"
+    print("[ok] hologram lifecycle: detach -> held -> float -> reattach -> on")
+
+    # 10. blueprint: draws while alive, expires after its lifetime
+    bp = GadgetBlueprint(np.array([320.0, 240.0]), 120.0, np.random.default_rng(3))
+    for k in bp.KINDS:
+        bp2 = GadgetBlueprint(np.array([320.0, 240.0]), 120.0,
+                              np.random.default_rng(5))
+        bp2.kind = k
+        for _ in range(30):
+            bp2.update(1 / 30.0)
+            f = np.zeros((480, 640, 3), np.uint8)
+            bp2.draw(f)
+            assert f.any(), f"blueprint '{k}' must draw pixels"
+    bp.t = bp.LIFE + 0.1
+    f = np.zeros((480, 640, 3), np.uint8)
+    bp.draw(f)
+    assert not bp.alive()
+    print(f"[ok] blueprint renders all {len(bp.KINDS)} kinds and expires")
+
+    # 11. body gear: draws on hands when on, does nothing when off
+    feats2 = classify_hands(res)
+    g = BodyGear()
+    f = np.zeros((480, 640, 3), np.uint8)
+    g.update(0.5)
+    g.draw(f, feats2)
+    assert f.any(), "body gear must draw with hands visible"
+    print("[ok] body gear renders with hands visible")
+
+    # 12. preview video recorder
     rec = Path(tempfile.gettempdir()) / "holo_selftest.mp4"
     rec.unlink(missing_ok=True)
     vw = cv2.VideoWriter(str(rec), cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (320, 240))
