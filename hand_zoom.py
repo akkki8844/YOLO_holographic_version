@@ -272,6 +272,256 @@ def draw_hand_holo(frame, hand, alpha: float = 0.55) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# The holographic web-shooter
+# --------------------------------------------------------------------------- #
+class WebShooterHologram:
+    """Tony-Stark-style holographic web-shooter rendered on the wrist.
+
+    Everything is drawn on a transparent overlay and additively blended into
+    the frame for the see-through "hard-light" hologram look.  The assembly is
+    anchored to the wrist and scales + rotates with the hand, so it looks
+    bolted on no matter how the hand is held.  Pure 2D vector drawing - a
+    handful of cv2 calls per frame, so it runs at full webcam speed.
+    """
+
+    def __init__(self):
+        self._rng = np.random.default_rng(7)
+        self._orbits = self._rng.uniform(0, 2 * math.pi, 9)      # particle phases
+        self._bars = self._rng.uniform(0, 2 * math.pi, 5)        # HUD bar phases
+
+    # -- tiny helpers ------------------------------------------------------ #
+    @staticmethod
+    def _px(hand, i, w, h):
+        return (hand[i].x * w, hand[i].y * h)
+
+    @staticmethod
+    def _ell_pt(cx, cy, a, b, ang, phi):
+        """Point on a rotated ellipse (ang, phi in radians)."""
+        c, s = math.cos(ang), math.sin(ang)
+        x = a * math.cos(phi) * c - b * math.sin(phi) * s
+        y = a * math.cos(phi) * s + b * math.sin(phi) * c
+        return (cx + x, cy + y)
+
+    # -- main entry -------------------------------------------------------- #
+    def draw(self, frame, hand, t) -> None:
+        if hand is None:
+            return
+        h, w = frame.shape[:2]
+        W = self._px(hand, 0, w, h)             # wrist
+        M = self._px(hand, 9, w, h)             # middle MCP
+        T = self._px(hand, 4, w, h)             # thumb tip
+        L = math.hypot(M[0] - W[0], M[1] - W[1])
+        if L < 12:
+            return                              # hand too far / tiny
+
+        ax = ((M[0] - W[0]) / L, (M[1] - W[1]) / L)   # wrist -> fingers
+        side = (-ax[1], ax[0])                        # across the wrist
+        if side[0] * (T[0] - W[0]) + side[1] * (T[1] - W[1]) < 0:
+            side = (-side[0], -side[1])               # point toward the thumb
+
+        C = (W[0] + ax[0] * 0.34 * L, W[1] + ax[1] * 0.34 * L)  # shooter core
+        R = 0.52 * L
+        ang = math.atan2(side[1], side[0]) + 0.06 * math.sin(t * 1.4)
+        a_ring, b_ring = R, 0.40 * R
+
+        overlay = np.zeros_like(frame)
+        self._draw_core(frame, overlay, hand, w, h, C, R, ang, a_ring, b_ring, t)
+        self._draw_rings(overlay, C, R, ang, a_ring, b_ring, t)
+        self._draw_threads(overlay, hand, w, h, C, ax, L, t)
+        self._draw_cartridge(overlay, hand, w, h, C, L, t)
+        self._draw_panels(overlay, C, side, ax, R, t)
+        self._draw_particles(overlay, C, R, ang, a_ring, b_ring, t)
+        self._draw_sweep(overlay, C, R, t)
+
+        # hologram flicker: subtle constant shimmer, never fully off
+        alpha = 0.78 * (0.92 + 0.08 * math.sin(t * 21.3) * math.sin(t * 7.7))
+        # hard-light glow: a HALF-RES blurred pass (halo) + the crisp lines.
+        sw, sh = max(1, w // 2), max(1, h // 2)
+        glow = cv2.GaussianBlur(cv2.resize(overlay, (sw, sh)), (0, 0), 1.4)
+        glow = cv2.resize(glow, (w, h), interpolation=cv2.INTER_LINEAR)
+        cv2.addWeighted(glow, 0.9, frame, 1.0, 0, frame)
+        cv2.addWeighted(overlay, max(alpha, 0.25), frame, 1.0, 0, frame)
+
+    # -- layers ------------------------------------------------------------- #
+    def _draw_core(self, frame, overlay, hand, w, h, C, R, ang, a, b, t):
+        # faint scanlines + soft glow inside the hologram's bounding box
+        x0 = max(0, int(C[0] - 1.5 * R)); x1 = min(frame.shape[1], int(C[0] + 1.5 * R))
+        y0 = max(0, int(C[1] - 1.5 * R)); y1 = min(frame.shape[0], int(C[1] + 1.5 * R))
+        for yy in range(y0, y1, 6):
+            cv2.line(overlay, (x0, yy), (x1, yy), _dim(HOLO_DIM, 0.22), 1)
+        cv2.circle(overlay, (int(C[0]), int(C[1])), int(0.30 * R),
+                   _dim(HOLO_BLUE, 0.30), -1, cv2.LINE_AA)
+
+        # arc-reactor core: inner ring + rotating sweep
+        cv2.ellipse(overlay, (int(C[0]), int(C[1])), (int(0.20 * R), int(0.085 * R)),
+                    math.degrees(ang), 0, 360, _dim(HOLO_CYAN, 0.9), 2, cv2.LINE_AA)
+        phi = t * 2.2
+        p1 = self._ell_pt(*C, 0.20 * R, 0.085 * R, ang, phi)
+        p2 = self._ell_pt(*C, 0.20 * R, 0.085 * R, ang, phi + 0.9)
+        cv2.line(overlay, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])),
+                 (255, 255, 255), 3, cv2.LINE_AA)
+
+        # radial tick marks slowly rotating around the core
+        for i in range(12):
+            ph = t * 0.25 + i * 2 * math.pi / 12
+            q1 = self._ell_pt(*C, 0.88 * R, 0.35 * R, ang, ph)
+            q2 = self._ell_pt(*C, 1.04 * R, 0.42 * R, ang, ph)
+            cv2.line(overlay, (int(q1[0]), int(q1[1])), (int(q2[0]), int(q2[1])),
+                     _dim(HOLO_CYAN, 0.5), 1, cv2.LINE_AA)
+
+        # occasional "data refresh" flash
+        if (t * 0.5) % 1.0 < 0.12:
+            cv2.ellipse(overlay, (int(C[0]), int(C[1])), (int(0.20 * R), int(0.085 * R)),
+                        math.degrees(ang), 0, 360, (255, 255, 255), 3, cv2.LINE_AA)
+
+    def _draw_rings(self, overlay, C, R, ang, a, b, t):
+        cx, cy = int(C[0]), int(C[1])
+        # three concentric wrist rings, brighter toward the outside
+        for k, (scale, alpha_k) in enumerate(((0.72, 0.30), (1.0, 0.55), (1.15, 0.75))):
+            cv2.ellipse(overlay, (cx, cy), (int(a * scale), int(b * scale)),
+                        math.degrees(ang), 0, 360, _dim(HOLO_CYAN, alpha_k),
+                        2 if k < 2 else 1, cv2.LINE_AA)
+        # outer dashed ring: two bright arcs + two dim arcs rotating
+        base = math.degrees(ang) + (t * 26.0) % 360
+        for off in (0, 180):
+            cv2.ellipse(overlay, (cx, cy), (int(a * 1.15), int(b * 1.15)),
+                        base + off, 0, 150, _dim(HOLO_CYAN, 0.85), 2, cv2.LINE_AA)
+            cv2.ellipse(overlay, (cx, cy), (int(a * 1.15), int(b * 1.15)),
+                        base + off + 165, 0, 30, _dim(HOLO_BLUE, 0.4), 2, cv2.LINE_AA)
+        # two bright energy arcs sweeping the main ring
+        for i in range(2):
+            ph0 = t * 1.6 + i * math.pi
+            pts = [self._ell_pt(*C, a, b, ang, ph0 + j * 0.05) for j in range(14)]
+            cv2.polylines(overlay, [np.array(pts, np.int32)], False,
+                          (255, 255, 255), 2, cv2.LINE_AA)
+
+    def _draw_threads(self, overlay, hand, w, h, C, ax, L, t):
+        # energy threads from the cartridge toward the fingertips
+        N = (C[0] + ax[0] * 0.55 * L, C[1] + ax[1] * 0.55 * L)
+        for i, ph in ((INDEX_TIP, 0.0), (MIDDLE_TIP, 2.1)):
+            P = self._px(hand, i, w, h)
+            k = 0.35 + 0.3 * math.sin(t * 3.0 + ph)
+            cv2.line(overlay, (int(N[0]), int(N[1])), (int(P[0]), int(P[1])),
+                     _dim(HOLO_CYAN, k), 2, cv2.LINE_AA)
+
+    def _draw_cartridge(self, overlay, hand, w, h, C, L, t):
+        # the web-shooter cartridge: a glowing barrel on the palm aiming at
+        # the index finger, with a draining/refilling web-fluid gauge
+        I = self._px(hand, INDEX_TIP, w, h)
+        dx, dy = I[0] - C[0], I[1] - C[1]
+        d = math.hypot(dx, dy) or 1.0
+        u = (dx / d, dy / d)
+        p = (-u[1], u[0])
+        b0 = (C[0] + u[0] * 0.30 * L, C[1] + u[1] * 0.30 * L)
+        b1 = (C[0] + u[0] * 0.85 * L, C[1] + u[1] * 0.85 * L)
+        half = 0.085 * L
+        quad = [(b0[0] + p[0] * half, b0[1] + p[1] * half),
+                (b0[0] - p[0] * half, b0[1] - p[1] * half),
+                (b1[0] - p[0] * half * 1.25, b1[1] - p[1] * half * 1.25),
+                (b1[0] + p[0] * half * 1.25, b1[1] + p[1] * half * 1.25)]
+        cv2.fillPoly(overlay, [np.array(quad, np.int32)], _dim(HOLO_BLUE, 0.30))
+        cv2.polylines(overlay, [np.array(quad, np.int32)], True,
+                      _dim(HOLO_CYAN, 0.85), 1, cv2.LINE_AA)
+
+        # web-fluid gauge: 4 orange segments that drain and refill
+        lit = 1 + int(3 * (0.5 + 0.5 * math.sin(t * 1.2)))
+        for i in range(4):
+            f = 0.30 + (i + 0.5) * 0.14
+            gx = b0[0] + u[0] * f * L + p[0] * half * 1.6
+            gy = b0[1] + u[1] * f * L + p[1] * half * 1.6
+            col = HOLO_ORANGE if i < lit else _dim(HOLO_ORANGE, 0.18)
+            cv2.circle(overlay, (int(gx), int(gy)), max(2, int(0.022 * L)), col, -1)
+
+        # nozzle: white core + orange tip + outer glow ring
+        nz = (int(b1[0]), int(b1[1]))
+        cv2.circle(overlay, nz, int(0.075 * L), _dim(HOLO_BLUE, 0.5), 2, cv2.LINE_AA)
+        cv2.circle(overlay, nz, int(0.045 * L), HOLO_ORANGE, -1, cv2.LINE_AA)
+        cv2.circle(overlay, nz, max(2, int(0.018 * L)), (255, 255, 255), -1)
+
+        # faint projection cone from the nozzle toward the index fingertip
+        tip = (int(I[0]), int(I[1]))
+        cone = np.array([nz, (tip[0] - int(p[0] * 0.09 * L), tip[1] - int(p[1] * 0.09 * L)),
+                         (tip[0] + int(p[0] * 0.09 * L), tip[1] + int(p[1] * 0.09 * L))],
+                        np.int32)
+        cv2.fillPoly(overlay, [cone], _dim(HOLO_BLUE, 0.10))
+
+    def _draw_panels(self, overlay, C, side, ax, R, t):
+        # two floating HUD panels beside the wrist, tilted like holoscreens
+        u = side
+        v = (-ax[0], -ax[1])
+        pa = (C[0] + side[0] * 1.32 * R, C[1] + side[1] * 1.32 * R)
+        self._panel_a(overlay, pa, u, v, 0.62 * R, 0.34 * R, t)
+        pb = (C[0] + side[0] * 1.36 * R, C[1] + side[1] * 1.36 * R - 0.5 * R)
+        self._panel_b(overlay, pb, u, v, 0.42 * R, 0.30 * R, t)
+
+    def _panel_a(self, overlay, c, u, v, wd, ht, t):
+        corners = [(c[0] + u[0] * wd - v[0] * ht, c[1] + u[1] * wd - v[1] * ht),
+                   (c[0] - u[0] * wd - v[0] * ht, c[1] - u[1] * wd - v[1] * ht),
+                   (c[0] - u[0] * wd + v[0] * ht, c[1] - u[1] * wd + v[1] * ht),
+                   (c[0] + u[0] * wd + v[0] * ht, c[1] + u[1] * wd + v[1] * ht)]
+        quad = np.array(corners, np.int32)
+        cv2.fillPoly(overlay, [quad], _dim(HOLO_BLUE, 0.16))
+        cv2.polylines(overlay, [quad], True, _dim(HOLO_CYAN, 0.7), 1, cv2.LINE_AA)
+        # animated data bars: horizontal stub + vertical bar growing upward
+        for i in range(5):
+            f = 0.20 + 0.60 * (0.5 + 0.5 * math.sin(t * 2.4 + self._bars[i]))
+            bx = c[0] + u[0] * (wd * (i / 4.0 - 0.5) + 0.05 * wd)
+            by = c[1] + u[1] * (wd * (i / 4.0 - 0.5) + 0.05 * wd)
+            bx2 = bx + u[0] * (0.05 * wd)
+            by2 = by + u[1] * (0.05 * wd)
+            bh = 0.35 * ht * f
+            cv2.line(overlay, (int(bx), int(by)), (int(bx2), int(by2)),
+                     _dim(HOLO_CYAN, 0.85), 2)
+            cv2.line(overlay, (int(bx2), int(by2)), (int(bx2 + v[0] * bh), int(by2 + v[1] * bh)),
+                     _dim(HOLO_CYAN, 0.85), 1)
+        # waveform line along the bottom edge
+        pts = []
+        for i in range(24):
+            f = i / 23.0
+            sx = c[0] + u[0] * wd * (f - 0.5) - v[0] * ht * 0.55
+            sy = c[1] + u[1] * wd * (f - 0.5) - v[1] * ht * 0.55
+            sy += v[1] * 0.10 * ht * math.sin(f * 9.0 + t * 5.0)
+            sx += u[0] * 0.10 * wd * math.sin(f * 9.0 + t * 5.0)
+            pts.append((sx, sy))
+        cv2.polylines(overlay, [np.array(pts, np.int32)], False,
+                      _dim(HOLO_CYAN, 0.65), 1, cv2.LINE_AA)
+
+    def _panel_b(self, overlay, c, u, v, wd, ht, t):
+        corners = [(c[0] + u[0] * wd - v[0] * ht, c[1] + u[1] * wd - v[1] * ht),
+                   (c[0] - u[0] * wd - v[0] * ht, c[1] - u[1] * wd - v[1] * ht),
+                   (c[0] - u[0] * wd + v[0] * ht, c[1] - u[1] * wd + v[1] * ht),
+                   (c[0] + u[0] * wd + v[0] * ht, c[1] + u[1] * wd + v[1] * ht)]
+        quad = np.array(corners, np.int32)
+        cv2.fillPoly(overlay, [quad], _dim(HOLO_BLUE, 0.14))
+        cv2.polylines(overlay, [quad], True, _dim(HOLO_CYAN, 0.6), 1, cv2.LINE_AA)
+        # gauge arc + rotating needle
+        cc = (int(c[0]), int(c[1]))
+        cv2.ellipse(overlay, cc, (int(wd * 0.62), int(ht * 0.62)),
+                    90, 200, 340, _dim(HOLO_CYAN, 0.7), 2, cv2.LINE_AA)
+        th = t * 1.8
+        nx = c[0] + u[0] * (0.5 * wd) * math.cos(th) - v[0] * (0.5 * ht) * math.sin(th)
+        ny = c[1] + u[1] * (0.5 * wd) * math.cos(th) - v[1] * (0.5 * ht) * math.sin(th)
+        cv2.line(overlay, cc, (int(nx), int(ny)), _dim(HOLO_ORANGE, 0.9), 2, cv2.LINE_AA)
+
+    def _draw_particles(self, overlay, C, R, ang, a, b, t):
+        # tiny holographic motes orbiting the outer ring
+        for i, ph0 in enumerate(self._orbits):
+            ph = ph0 + t * (0.5 + 0.06 * i)
+            p = self._ell_pt(*C, a * 1.08, b * 1.08, ang, ph)
+            tw = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(t * 5.0 + ph0 * 3.0))
+            cv2.circle(overlay, (int(p[0]), int(p[1])), 2, _dim(HOLO_CYAN, tw), -1)
+
+    def _draw_sweep(self, overlay, C, R, t):
+        # a bright scan line sweeping down through the hologram periodically
+        period = 1.4
+        f = (t % period) / period
+        sy = C[1] + (f - 0.5) * 2.6 * R
+        x0 = int(C[0] - 1.8 * R); x1 = int(C[0] + 1.8 * R)
+        cv2.line(overlay, (x0, int(sy) - 1), (x1, int(sy) - 1), _dim(HOLO_CYAN, 0.3), 1)
+        cv2.line(overlay, (x0, int(sy)), (x1, int(sy)), _dim(HOLO_CYAN, 0.75), 1)
+
+
+# --------------------------------------------------------------------------- #
 # Camera / sources
 # --------------------------------------------------------------------------- #
 def open_camera(index: int | None):
@@ -357,6 +607,7 @@ def run(args: argparse.Namespace) -> int:
             pass
         cv2.resizeWindow(win, 960, 720)
 
+    holo = WebShooterHologram()
     frame_idx = 0
     last_ts = 0
     fps = 30.0
@@ -436,6 +687,7 @@ def run(args: argparse.Namespace) -> int:
             last_frame_t = t0
             if right_feat is not None:
                 draw_hand_holo(frame, right_feat["landmarks"])
+                holo.draw(frame, right_feat["landmarks"], t0)
 
             if recorder is not None:        # recording: red dot only, no text
                 cv2.circle(frame, (frame.shape[1] - 42, 30), 8, (0, 0, 255), -1)
