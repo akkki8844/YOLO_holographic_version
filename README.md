@@ -48,11 +48,37 @@ web-shooter ~6 ms, gauntlets ~6 ms, blueprint ~4 ms per frame. Detection is
 the only bottleneck, so the app runs at full webcam speed even with every
 system active at once.
 
+## Use it on video calls (WhatsApp, Teams, Zoom, Meet) 🎥
+
+The hologram can be broadcast as a **virtual camera**, so anyone on a call
+sees it live on your hands — while the script is running. One-time setup:
+
+1. **Double-click `setup_virtualcam.bat`** — it installs `pyvirtualcam` into
+   the virtual environment, downloads the **Unity Capture** driver, and
+   registers it (click **Yes** on the one-time administrator prompt).
+   *(Alternative: install [OBS Studio](https://obsproject.com/) and start its
+   built-in Virtual Camera instead — no driver prompt, but OBS must be open.)*
+2. **Run the app with the broadcast flag:**
+
+   ```bash
+   run.bat --virtualcam
+   # or: python hand_zoom.py --virtualcam
+   ```
+
+3. **In WhatsApp** → Settings → Video (or the camera picker in any call) →
+   select **“Unity Video Capture”** (or “OBS Virtual Camera”).
+
+The virtual camera only produces video while the script runs — close it and
+the device goes dark. Frames are sent unmirrored so the other person sees a
+normal camera view. `--vc-backend obs` forces the OBS backend if both are
+installed.
+
 ## Running
 
 ```bash
 python hand_zoom.py             # show your hands to the camera
 python hand_zoom.py --camera 1  # force a specific webcam
+python hand_zoom.py --virtualcam  # broadcast to video calls (see above)
 python hand_zoom.py --record    # save the preview to recordings/
 python hand_zoom.py --selftest  # headless self-test (no camera needed)
 ```

@@ -1,31 +1,46 @@
 #!/usr/bin/env python3
-"""hand_zoom.py - real-time hand tracking for a hologram studio.
+"""hand_zoom.py - a holographic Spider-Man web-shooter / gadget studio.
 
-This version is the TRACKING CORE: a MediaPipe hand-landmarker pipeline with
-an aggressive camera setup (720p MJPEG + fallback ladder) and per-hand
-geometry features (finger curls, pinch, fist, spread) that later commits turn
-into holograms and gestures.
+Tony-Stark-style holograms, controlled entirely by hand gestures.  When the
+webcam sees your hand, a futuristic holographic web-shooter materialises on
+your wrist.  Everything is drawn as see-through "hard-light" holograms - no
+mouse, no keyboard, no input injection, no on-screen text.
+
+Gestures
+--------
+  Right-hand PINCH (thumb+index+middle) ....... take the web-shooter OFF your
+                                               wrist (detach animation) / put
+                                               it BACK ON (fly-back animation)
+  FIST, hold ~0.5 s, then OPEN .................. spawn a holographic BLUEPRINT:
+                                               a detailed animated breakdown of
+                                               a Spider-Man gadget
+  BOTH FISTS, hold ~0.6 s, then OPEN ............ toggle holographic BODY GEAR
+                                               (Iron-Man style gauntlets on both
+                                               wrists + chest arc reactor)
+  V ............................................ start / stop recording
+  Esc / Q ...................................... quit
+
+Video calls
+-----------
+  With  --virtualcam  the rendered hologram is broadcast to a Windows virtual
+  camera (Unity Capture or OBS), so WhatsApp / Teams / Zoom / Meet see it
+  while the script runs.  See README.md and setup_virtualcam.bat.
 
 Recognition is tuned to be as forgiving as possible:
   * MediaPipe confidence thresholds at the practical minimum
-    (0.10 / 0.10 / 0.20) so hands are picked up in weak light, at the frame
-    edges and at distance
-  * the camera is pushed to 1280x720 (MJPEG + low-latency buffers when the
-    driver supports them) and falls back to lower resolutions if refused
-  * both hands are tracked and labelled right/left via MediaPipe handedness
-    (mirrored/selfie input), with a mirrored-frame position fallback
+    (0.10 / 0.10 / 0.20)
+  * the camera is pushed to 1280x720 (MJPEG + low-latency buffers) with an
+    automatic fallback ladder
+  * gesture features are EMA-smoothed per hand with hysteresis and frame
+    confirmation; dropped hands are ghosted so hiccups never cancel a gesture
 
 Usage
 -----
-    python hand_zoom.py             # show your hands to the camera
-    python hand_zoom.py --camera 1  # force a specific webcam
-    python hand_zoom.py --record    # save the preview to recordings/
-    python hand_zoom.py --selftest  # headless self-test (no camera needed)
-
-Keys while running
-------------------
-    Esc / Q   quit
-    V         start / stop recording the preview
+    python hand_zoom.py               # show your hands to the camera
+    python hand_zoom.py --camera 1    # force a specific webcam
+    python hand_zoom.py --virtualcam  # broadcast to video calls (see README)
+    python hand_zoom.py --record      # save the preview to recordings/
+    python hand_zoom.py --selftest    # headless self-test (no camera needed)
 """
 
 from __future__ import annotations
@@ -33,9 +48,11 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import queue
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -1362,6 +1379,112 @@ def open_source(path: str):
 
 
 # --------------------------------------------------------------------------- #
+# Windows virtual camera (show the hologram on video calls)
+# --------------------------------------------------------------------------- #
+class VirtualCamError(RuntimeError):
+    """Raised when no usable virtual-camera backend could be initialised."""
+
+
+class VirtualCam:
+    """Push the rendered frames to a Windows virtual camera via pyvirtualcam.
+
+    Backends are tried in order: 'unitycapture' (the Unity Capture DirectShow
+    filter, a one-time admin install) then 'obs' (OBS Studio's built-in
+    virtual camera).  The device only produces video while this app is
+    running, so WhatsApp / Teams / Zoom / Meet see the hologram exactly when
+    the script runs and nothing when it stops.
+
+    Frames are pushed through a tiny bounded queue to a background thread, so
+    a slow consumer never stalls the tracking/render loop.
+    """
+
+    def __init__(self, width: int, height: int, fps: float, backend: str = "auto"):
+        try:
+            import pyvirtualcam  # optional dependency, imported lazily
+        except ImportError as exc:
+            raise VirtualCamError(
+                "pyvirtualcam is not installed - run setup_virtualcam.bat"
+            ) from exc
+        candidates = ("unitycapture", "obs") if backend == "auto" else (backend,)
+        self._cam = None
+        self._backend = None
+        errs = []
+        for b in candidates:
+            try:
+                self._cam = pyvirtualcam.Camera(
+                    width=width, height=height, fps=int(max(15.0, min(30.0, fps))),
+                    backend=b, fmt=pyvirtualcam.PixelFormat.BGR,
+                )
+                self._backend = b
+                break
+            except Exception as exc:  # noqa: BLE001 - try the next backend
+                errs.append(f"{b}: {" ".join(str(exc).split())}")
+        if self._cam is None:
+            raise VirtualCamError(" | ".join(errs))
+        self._stop = threading.Event()
+        self._queue: queue.Queue = queue.Queue(maxsize=2)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                frame = self._queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                self._cam.send(frame)
+                self._cam.sleep_until_next_frame()
+            except Exception:  # noqa: BLE001 - consumer vanished, stop quietly
+                break
+
+    def send(self, frame) -> None:
+        if self._cam is None:
+            return
+        try:
+            if self._queue.full():
+                try:
+                    self._queue.get_nowait()   # drop the stale frame
+                except queue.Empty:
+                    pass
+            self._queue.put_nowait(frame.copy())
+        except queue.Full:
+            pass
+
+    def close(self) -> None:
+        self._stop.set()
+        if getattr(self, "_thread", None) is not None:
+            self._thread.join(timeout=1.0)
+        if self._cam is not None:
+            try:
+                self._cam.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._cam = None
+
+    @staticmethod
+    def try_create(width: int, height: int, fps: float, backend: str = "auto"):
+        """Create a VirtualCam or return None with setup guidance on failure."""
+        try:
+            return VirtualCam(width, height, fps, backend)
+        except VirtualCamError as exc:
+            print(f"[virtualcam] unavailable ({exc})")
+            print(VIRTUALCAM_SETUP_HINT)
+            return None
+
+
+VIRTUALCAM_SETUP_HINT = """\
+[virtualcam] To show the hologram on video calls (WhatsApp, Teams, Zoom...):
+  1) run  setup_virtualcam.bat   (installs pyvirtualcam + the Unity Capture
+     driver; one admin prompt, done once)
+  2) or install OBS Studio and start its built-in Virtual Camera
+  3) relaunch with:  python hand_zoom.py --virtualcam
+  4) in the call app pick the camera: "Unity Video Capture" (or "OBS Virtual
+     Camera"). The hologram appears only while this script runs.
+"""
+
+
+# --------------------------------------------------------------------------- #
 # Main loop
 # --------------------------------------------------------------------------- #
 def run(args: argparse.Namespace) -> int:
@@ -1388,6 +1511,8 @@ def run(args: argparse.Namespace) -> int:
     holo = WebShooterHologram()
     blueprint = None
     gear = None
+    vcam = None
+    vcam_enabled = bool(args.virtualcam)
     frame_idx = 0
     last_ts = 0
     fps = 30.0
@@ -1419,11 +1544,15 @@ def run(args: argparse.Namespace) -> int:
         print(f"[record] started -> {rec_path}")
 
     def release():
-        nonlocal recorder
+        nonlocal recorder, vcam
         if recorder is not None:
             recorder.release()
             print(f"[record] saved {rec_path}")
             recorder = None
+        if vcam is not None:
+            vcam.close()
+            print(f"[virtualcam] stopped (backend: {vcam._backend})")
+            vcam = None
         if show_window:
             cv2.destroyAllWindows()
         try:
@@ -1505,8 +1634,21 @@ def run(args: argparse.Namespace) -> int:
                     blueprint = None
 
             if recorder is not None:        # recording: red dot only, no text
-                cv2.circle(frame, (frame.shape[1] - 42, 30), 8, (0, 0, 255), -1)
+                if not vcam_enabled or vcam is None:  # keep the dot out of calls
+                    cv2.circle(frame, (frame.shape[1] - 42, 30), 8, (0, 0, 255), -1)
                 recorder.write(frame)
+
+            # -- virtual camera (video calls see the hologram) ----------------- #
+            if vcam_enabled:
+                if vcam is None:
+                    vcam = VirtualCam.try_create(frame.shape[1], frame.shape[0],
+                                                 30.0, args.vc_backend)
+                    if vcam is None:
+                        vcam_enabled = False
+                if vcam is not None:
+                    # flip back: other callers should see a normal (unmirrored)
+                    # camera view, not your mirrored selfie preview
+                    vcam.send(cv2.flip(frame, 1))
 
             if show_window:
                 cv2.imshow(win, frame)
@@ -1735,7 +1877,16 @@ def selftest(args: argparse.Namespace) -> int:
     assert f.any(), "body gear must draw with hands visible"
     print("[ok] body gear renders with hands visible")
 
-    # 12. preview video recorder
+    # 12. virtual camera: works when a backend exists, degrades gracefully
+    #     when it doesn't (both outcomes are valid; never leak the camera)
+    vc = VirtualCam.try_create(320, 240, 30.0, backend="unitycapture")
+    if vc is not None:
+        vc.close()
+        print("[ok] virtual camera backend present and usable")
+    else:
+        print("[ok] virtual camera degrades gracefully when the driver is missing")
+
+    # 13. preview video recorder
     rec = Path(tempfile.gettempdir()) / "holo_selftest.mp4"
     rec.unlink(missing_ok=True)
     vw = cv2.VideoWriter(str(rec), cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (320, 240))
@@ -1769,6 +1920,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="run without the preview window (headless)")
     p.add_argument("--verbose", action="store_true",
                    help="log tracking status to the console")
+    p.add_argument("--virtualcam", action="store_true",
+                   help="broadcast the preview to a Windows virtual camera "
+                        "so video calls (WhatsApp, Teams, Zoom) see the hologram")
+    p.add_argument("--vc-backend", choices=("auto", "unitycapture", "obs"),
+                   default="auto", help="virtual-camera backend (default: auto)")
     p.add_argument("--record", action="store_true",
                    help="start recording the preview to recordings/ from launch")
     p.add_argument("--selftest", action="store_true",
