@@ -77,6 +77,9 @@ HOLO_CYAN = (235, 255, 150)      # bright cyan-white
 HOLO_BLUE = (255, 170, 60)       # deep blue
 HOLO_ORANGE = (55, 150, 255)     # web-fluid orange
 HOLO_DIM = (120, 160, 80)        # faded cyan for depth layers
+GOLD = (70, 190, 255)            # Iron-Man gold
+GOLD_DIM = (45, 110, 150)        # faded gold
+RED = (60, 60, 255)              # Spidey / Stark red
 
 WRIST, MIDDLE_MCP = 0, 9
 INDEX_TIP, MIDDLE_TIP = 8, 12
@@ -1115,6 +1118,179 @@ class GadgetBlueprint:
 
 
 # --------------------------------------------------------------------------- #
+# Holographic body gear (both fists -> open)
+# --------------------------------------------------------------------------- #
+class BodyGear:
+    """Iron-Man-style holographic gear on the visible part of the body.
+
+    Both fists held then opened toggles this on/off.  While on: armored
+    gauntlets wrap both wrists (segmented plates, palm arc reactor, knuckle
+    nodes, energy veins) and a chest arc reactor materialises between the two
+    wrists whenever both hands are visible.
+    """
+
+    def __init__(self):
+        self.t = 0.0
+        self._rng = np.random.default_rng(11)
+        self._ph = [float(x) for x in self._rng.uniform(0, 2 * math.pi, 8)]
+
+    def update(self, dt):
+        self.t += dt
+
+    def draw(self, frame, feats):
+        w, h = frame.shape[1], frame.shape[0]
+        live = [f for f in feats if f["landmarks"] is not None]
+        if not live:
+            return
+        overlay = np.zeros_like(frame)
+        for f in live:
+            self._gauntlet(overlay, f, w, h)
+        if len(live) >= 2:
+            self._chest(overlay, live, w, h)
+        sw, sh = max(1, w // 2), max(1, h // 2)
+        glow = cv2.GaussianBlur(cv2.resize(overlay, (sw, sh)), (0, 0), 1.4)
+        glow = cv2.resize(glow, (w, h), interpolation=cv2.INTER_LINEAR)
+        cv2.addWeighted(glow, 0.8, frame, 1.0, 0, frame)
+        cv2.addWeighted(overlay, 0.85, frame, 1.0, 0, frame)
+
+    def _gauntlet(self, overlay, f, w, h):
+        W = f["wrist"] * np.array([w, h])
+        M = f["mcp9"] * np.array([w, h])
+        T = f["thumb_tip"] * np.array([w, h])
+        L = float(np.linalg.norm(M - W))
+        if L < 10:
+            return
+        ax = ((M[0] - W[0]) / L, (M[1] - W[1]) / L)
+        side = (-ax[1], ax[0])
+        if side[0] * (T[0] - W[0]) + side[1] * (T[1] - W[1]) < 0:
+            side = (-side[0], -side[1])
+        arm = (-ax[0], -ax[1])                       # toward the elbow
+        t = self.t
+        k = lambda a: 0.55 + 0.35 * math.sin(t * 2.2 + a)  # noqa: E731
+
+        # forearm cuff: tapered armour running from the wrist up the arm
+        w0 = 0.30 * L
+        w1 = 0.46 * L
+        clen = 1.25 * L
+        A = (W[0] + arm[0] * clen, W[1] + arm[1] * clen)
+        cuff = np.array([
+            (int(W[0] + side[0] * w0), int(W[1] + side[1] * w0)),
+            (int(W[0] - side[0] * w0), int(W[1] - side[1] * w0)),
+            (int(A[0] - side[0] * w1), int(A[1] - side[1] * w1)),
+            (int(A[0] + side[0] * w1), int(A[1] + side[1] * w1)),
+        ], np.int32)
+        cv2.fillPoly(overlay, [cuff], _dim(GOLD_DIM, 0.35))
+        cv2.polylines(overlay, [cuff], True, _dim(GOLD, k(0.0)), 2, cv2.LINE_AA)
+        for i in range(1, 4):                         # segmented plates
+            fr = i / 4.0
+            bx = W[0] + (A[0] - W[0]) * fr
+            by = W[1] + (A[1] - W[1]) * fr
+            ww = w0 + (w1 - w0) * fr
+            cv2.line(overlay,
+                     (int(bx + side[0] * ww), int(by + side[1] * ww)),
+                     (int(bx - side[0] * ww), int(by - side[1] * ww)),
+                     _dim(GOLD, 0.6), 1, cv2.LINE_AA)
+        # glowing seam lines down both edges of the cuff
+        for sgn in (1, -1):
+            cv2.line(overlay,
+                     (int(W[0] + side[0] * w0 * sgn), int(W[1] + side[1] * w0 * sgn)),
+                     (int(A[0] + side[0] * w1 * sgn), int(A[1] + side[1] * w1 * sgn)),
+                     _dim(GOLD, 0.45), 1, cv2.LINE_AA)
+
+        # palm arc reactor
+        P = (W[0] + arm[0] * 0.40 * L, W[1] + arm[1] * 0.40 * L)
+        pr = 0.22 * L
+        cv2.circle(overlay, (int(P[0]), int(P[1])), int(pr), _dim(GOLD, k(1.0)),
+                   2, cv2.LINE_AA)
+        cv2.circle(overlay, (int(P[0]), int(P[1])), int(pr * 0.55),
+                   _dim(GOLD, 0.9), 1, cv2.LINE_AA)
+        cv2.circle(overlay, (int(P[0]), int(P[1])), int(pr * 0.28),
+                   (255, 255, 255), -1, cv2.LINE_AA)
+        for i in range(6):                            # reactor rays
+            ph = t * 1.8 + i * math.pi / 3
+            cv2.line(overlay, (int(P[0] + math.cos(ph) * pr * 0.4),
+                               int(P[1] + math.sin(ph) * pr * 0.4)),
+                     (int(P[0] + math.cos(ph) * pr * 1.5),
+                      int(P[1] + math.sin(ph) * pr * 1.5)),
+                     _dim(GOLD, 0.5), 1, cv2.LINE_AA)
+
+        # knuckle nodes along the finger bases
+        for i in (5, 9, 13, 17):
+            p = f["landmarks"][i]
+            px, py = p.x * w, p.y * h
+            cv2.circle(overlay, (int(px), int(py)), max(2, int(0.028 * L)),
+                       _dim(GOLD, k(2.0 + i)), -1, cv2.LINE_AA)
+            cv2.circle(overlay, (int(px), int(py)), max(3, int(0.045 * L)),
+                       _dim(GOLD, 0.4), 1, cv2.LINE_AA)
+
+        # energy veins pulsing from the cuff toward the fingertips
+        for i in (INDEX_TIP, MIDDLE_TIP):
+            p = f["landmarks"][i]
+            px, py = p.x * w, p.y * h
+            cv2.line(overlay, (int(P[0]), int(P[1])), (int(px), int(py)),
+                     _dim(GOLD, 0.35 + 0.3 * k(i)), 1, cv2.LINE_AA)
+
+        # orbiting motes around the cuff
+        for i, ph0 in enumerate(self._ph):
+            ph = ph0 + t * 0.7
+            ox = W[0] + arm[0] * (0.35 * L) + math.cos(ph) * 0.30 * L
+            oy = W[1] + arm[1] * (0.35 * L) + math.sin(ph) * 0.30 * L
+            cv2.circle(overlay, (int(ox), int(oy)), 2,
+                       _dim(GOLD, 0.4 + 0.4 * math.sin(t * 4.0 + ph0)), -1)
+
+    def _chest(self, overlay, feats, w, h):
+        p1 = feats[0]["wrist"] * np.array([w, h])
+        p2 = feats[1]["wrist"] * np.array([w, h])
+        C = ((p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0)
+        R = clamp01(0.34 * float(np.linalg.norm(p1 - p2)) / 720.0) * 260.0
+        R = max(40.0, min(240.0, R))
+        t = self.t
+        k = lambda a: 0.5 + 0.4 * math.sin(t * 2.4 + a)  # noqa: E731
+        # chest arc reactor
+        cv2.circle(overlay, (int(C[0]), int(C[1])), int(R), _dim(GOLD, k(0.0)),
+                   2, cv2.LINE_AA)
+        base = (t * 22.0) % 360
+        for off in (0, 120, 240):
+            cv2.ellipse(overlay, (int(C[0]), int(C[1])), (int(R), int(R)),
+                        base + off, 0, 90, _dim(GOLD, 0.8), 2, cv2.LINE_AA)
+        cv2.circle(overlay, (int(C[0]), int(C[1])), int(R * 0.62),
+                   _dim(GOLD_DIM, 0.5), 1, cv2.LINE_AA)
+        cv2.circle(overlay, (int(C[0]), int(C[1])), int(R * 0.30),
+                   _dim(GOLD, 0.9), -1, cv2.LINE_AA)
+        cv2.circle(overlay, (int(C[0]), int(C[1])), int(R * 0.12),
+                   (255, 255, 255), -1, cv2.LINE_AA)
+        ph = t * 2.0
+        cv2.line(overlay, (int(C[0]), int(C[1])),
+                 (int(C[0] + math.cos(ph) * R * 0.55),
+                  int(C[1] + math.sin(ph) * R * 0.55)),
+                 (255, 255, 255), 2, cv2.LINE_AA)
+        for i in range(8):                            # rays
+            a = ph + i * math.pi / 4
+            cv2.line(overlay, (int(C[0] + math.cos(a) * R * 0.68),
+                               int(C[1] + math.sin(a) * R * 0.68)),
+                     (int(C[0] + math.cos(a) * R * 1.15),
+                      int(C[1] + math.sin(a) * R * 1.15)),
+                     _dim(GOLD, 0.45), 1, cv2.LINE_AA)
+        # arm energy lines curving from each wrist to the reactor
+        for p in (p1, p2):
+            mid = ((p[0] + C[0]) / 2.0 + (p[0] - C[0]) * 0.15,
+                   (p[1] + C[1]) / 2.0)
+            pts = [(int(p[0]), int(p[1])),
+                   (int(mid[0]), int(mid[1])),
+                   (int(C[0]), int(C[1]) + int(R * 0.55))]
+            cv2.polylines(overlay, [np.array(pts, np.int32)], False,
+                          _dim(GOLD, 0.35), 1, cv2.LINE_AA)
+        # orbiting motes
+        for i, ph0 in enumerate(self._ph[:5]):
+            a = ph0 + t * 0.9
+            mx = C[0] + math.cos(a) * R * 1.25
+            my = C[1] + math.sin(a) * R * 0.35
+            cv2.circle(overlay, (int(mx), int(my)), 2, _dim(GOLD, k(i)), -1)
+
+
+
+
+# --------------------------------------------------------------------------- #
 # Camera / sources
 # --------------------------------------------------------------------------- #
 def open_camera(index: int | None):
@@ -1203,6 +1379,7 @@ def run(args: argparse.Namespace) -> int:
     tracker = GestureTracker()
     holo = WebShooterHologram()
     blueprint = None
+    gear = None
     frame_idx = 0
     last_ts = 0
     fps = 30.0
@@ -1295,6 +1472,9 @@ def run(args: argparse.Namespace) -> int:
                 elif evt == "release":
                     holo.release(payload, frame.shape[1], frame.shape[0], now)
                     print("[gesture] release ->", holo.state)
+                elif evt == "gear":
+                    gear = BodyGear() if gear is None else None
+                    print("[gesture] body gear", "ON" if gear else "OFF")
 
             # if the right hand vanishes while holding the shooter, let it float
             if right_feat is None and holo.state in ("held", "detach"):
@@ -1312,6 +1492,9 @@ def run(args: argparse.Namespace) -> int:
                 blueprint.draw(frame)
                 if not blueprint.alive():
                     blueprint = None
+            if gear is not None:
+                gear.update(dt)
+                gear.draw(frame, feats)
 
             if recorder is not None:        # recording: red dot only, no text
                 cv2.circle(frame, (frame.shape[1] - 42, 30), 8, (0, 0, 255), -1)
