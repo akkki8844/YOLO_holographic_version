@@ -833,6 +833,288 @@ class WebShooterHologram:
 
 
 # --------------------------------------------------------------------------- #
+# Holographic gadget blueprint (fist -> open)
+# --------------------------------------------------------------------------- #
+class GadgetBlueprint:
+    """Animated holographic exploded-view breakdown of a Spider-Man gadget.
+
+    Fist -> open spawns one of these at the open hand.  It loops an
+    assemble -> hold -> explode cycle so every part, dimension line and
+    part-dot is clearly readable, then fades out after a few seconds.
+    All text-free: part order is marked with dot-count badges.
+    """
+
+    KINDS = ("webshooter", "cartridge", "drone")
+    LIFE = 7.0
+    CYCLE = 3.4
+
+    def __init__(self, px, R, rng):
+        self.px = (float(px[0]), float(px[1]))
+        self.R = max(40.0, float(R))
+        self.kind = str(rng.choice(self.KINDS))
+        self.t = 0.0
+        self._spin = float(rng.uniform(0, 2 * math.pi))
+        self._phases = [float(rng.uniform(0, 2 * math.pi)) for _ in range(6)]
+
+    def alive(self) -> bool:
+        return self.t < self.LIFE
+
+    def update(self, dt):
+        self.t += dt
+
+    # -- helpers ------------------------------------------------------------- #
+    @staticmethod
+    def _place(c, R, rot, spread, ox, oy):
+        c_, s_ = math.cos(rot), math.sin(rot)
+        x = c[0] + (ox * spread * c_ - oy * spread * s_) * R
+        y = c[1] + (ox * spread * s_ + oy * spread * c_) * R
+        return (x, y)
+
+    @staticmethod
+    def _poly(overlay, c, R, rot, spread, pts, color, fill=None):
+        c_, s_ = math.cos(rot), math.sin(rot)
+        arr = []
+        for (ox, oy) in pts:
+            x = c[0] + (ox * spread * c_ - oy * spread * s_) * R
+            y = c[1] + (ox * spread * s_ + oy * spread * c_) * R
+            arr.append((int(x), int(y)))
+        if fill is not None:
+            cv2.fillPoly(overlay, [np.array(arr, np.int32)], fill)
+        cv2.polylines(overlay, [np.array(arr, np.int32)], True, color, 1, cv2.LINE_AA)
+
+    @staticmethod
+    def _dimline(overlay, p1, p2, color, dash=7, gap=5):
+        x1, y1 = p1; x2, y2 = p2
+        d = math.hypot(x2 - x1, y2 - y1)
+        if d < 2:
+            return
+        ux, uy = (x2 - x1) / d, (y2 - y1) / d
+        pos = 0.0
+        while pos < d:
+            e = min(d, pos + dash)
+            cv2.line(overlay, (int(x1 + ux * pos), int(y1 + uy * pos)),
+                     (int(x1 + ux * e), int(y1 + uy * e)), color, 1)
+            pos = e + gap
+        for (px, py) in (p1, p2):
+            cv2.line(overlay, (int(px - uy * 6), int(py + ux * 6)),
+                     (int(px + uy * 6), int(py - ux * 6)), color, 1)
+
+    @staticmethod
+    def _badge(overlay, p, n, color, R):
+        cv2.circle(overlay, (int(p[0]), int(p[1])), int(0.045 * R),
+                   _dim(color, 0.6), 1, cv2.LINE_AA)
+        for i in range(n):
+            a = -math.pi / 2 + (i - (n - 1) / 2.0) * 0.5
+            dx = math.cos(a) * 0.018 * R
+            dy = math.sin(a) * 0.018 * R
+            cv2.circle(overlay, (int(p[0] + dx), int(p[1] + dy)),
+                       max(1, int(0.012 * R)), color, -1)
+
+    # -- main ---------------------------------------------------------------- #
+    def draw(self, frame):
+        w, h = frame.shape[1], frame.shape[0]
+        fade = 1.0 if self.t < self.LIFE - 1.2 \
+            else clamp01((self.LIFE - self.t) / 1.2)
+        if fade <= 0:
+            return
+        scale_in = 1.0
+        if self.t < 0.4:                        # spawn-in: grow from 0 with
+            f = self.t / 0.4                    # ease-out-back overshoot
+            scale_in = 1.0 + 2.7 * (f - 1.0) ** 3 + 1.7 * (f - 1.0) ** 2
+        cyc = (self.t % self.CYCLE) / self.CYCLE
+        if cyc < 0.45:
+            f = cyc / 0.45                     # assembling
+        elif cyc < 0.75:
+            f = 1.0                            # held together
+        else:
+            f = 1.0 - (cyc - 0.75) / 0.25      # exploding apart
+        spread = clamp01(1.0 - f)
+
+        R = self.R * scale_in
+        c = self.px
+        rot = self._spin + self.t * 0.25
+        overlay = np.zeros_like(frame)
+
+        # faint bounding-box scanlines + converging focus ring at spawn
+        x0 = max(0, int(c[0] - 1.5 * R)); x1 = min(w, int(c[0] + 1.5 * R))
+        y0 = max(0, int(c[1] - 1.5 * R)); y1 = min(h, int(c[1] + 1.5 * R))
+        for yy in range(y0, y1, 7):
+            cv2.line(overlay, (x0, yy), (x1, yy), _dim(HOLO_DIM, 0.16), 1)
+        if self.t < 0.5:
+            fr = self.t / 0.5
+            rr = (2.3 - 1.3 * fr) * R
+            cv2.ellipse(overlay, (int(c[0]), int(c[1])), (int(rr), int(0.4 * rr)),
+                        math.degrees(rot), 0, 360,
+                        _dim(HOLO_CYAN, 0.8 * (1.0 - fr)), 2, cv2.LINE_AA)
+
+        if self.kind == "webshooter":
+            self._draw_ws(overlay, c, R, rot, spread, t=self.t)
+        elif self.kind == "cartridge":
+            self._draw_cart(overlay, c, R, rot, spread, t=self.t)
+        else:
+            self._draw_drone(overlay, c, R, rot, spread, t=self.t)
+
+        # blend with glow, applying fade
+        if fade < 1.0:
+            overlay = cv2.addWeighted(overlay, fade, np.zeros_like(frame), 0, 0)
+        sw, sh = max(1, w // 2), max(1, h // 2)
+        glow = cv2.GaussianBlur(cv2.resize(overlay, (sw, sh)), (0, 0), 1.3)
+        glow = cv2.resize(glow, (w, h), interpolation=cv2.INTER_LINEAR)
+        cv2.addWeighted(glow, 0.8, frame, 1.0, 0, frame)
+        cv2.addWeighted(overlay, 0.9, frame, 1.0, 0, frame)
+
+    # -- kind 1: the Mark V web-shooter -------------------------------------- #
+    def _draw_ws(self, overlay, c, R, rot, spread, t):
+        P = lambda ox, oy: self._place(c, R, rot, spread, ox, oy)  # noqa: E731
+        k = lambda a: 0.55 + 0.3 * math.sin(t * 2.0 + a)  # noqa: E731
+        b = P(-0.55, 0.0)                            # wrist band
+        self._poly(overlay, b, R * 0.45, rot, 1.0,
+                   [(-1.5, -0.7), (-0.4, -1.0), (0.4, -1.0), (0.9, -0.6),
+                    (0.9, 0.6), (0.4, 1.0), (-0.4, 1.0), (-1.5, 0.7)],
+                   _dim(HOLO_BLUE, 0.5) if spread > 0.1 else _dim(HOLO_CYAN, 0.9))
+        self._poly(overlay, b, R * 0.45, rot, 1.0,
+                   [(-1.3, -0.45), (0.55, -0.6), (0.7, 0.0), (0.55, 0.6),
+                    (-1.3, 0.45)], _dim(HOLO_CYAN, k(1.0)), fill=_dim(HOLO_BLUE, 0.12))
+        hm = P(0.0, 0.0)                             # main housing (center)
+        self._poly(overlay, hm, R, rot, 1.0,
+                   [(-0.55, -0.5), (0.35, -0.62), (0.6, 0.0), (0.35, 0.62),
+                    (-0.55, 0.5)], _dim(HOLO_CYAN, k(0.0)),
+                   fill=_dim(HOLO_BLUE, 0.14))
+        cv2.ellipse(overlay, (int(hm[0]), int(hm[1])),
+                    (int(0.30 * R), int(0.14 * R)), math.degrees(rot),
+                    0, 360, _dim(HOLO_CYAN, 0.9), 1, cv2.LINE_AA)
+        cell = P(-0.12, 0.02)                        # fluid cell (pulsing orange)
+        cv2.circle(overlay, (int(cell[0]), int(cell[1])), int(0.16 * R),
+                   _dim(HOLO_ORANGE, k(2.0)), 1, cv2.LINE_AA)
+        cv2.circle(overlay, (int(cell[0]), int(cell[1])),
+                   int(0.16 * R * (0.7 + 0.3 * k(2.0))),
+                   _dim(HOLO_ORANGE, 0.35), -1)
+        bl = P(0.62, 0.06)                           # barrel
+        self._poly(overlay, bl, R * 0.62, rot + 0.5, 1.0,
+                   [(-0.6, -0.32), (0.9, -0.22), (0.9, 0.22), (-0.6, 0.32)],
+                   _dim(HOLO_CYAN, k(3.0)))
+        nz = P(1.05, 0.09)                           # nozzle + tip
+        cv2.circle(overlay, (int(nz[0]), int(nz[1])), int(0.13 * R),
+                   HOLO_ORANGE, 1, cv2.LINE_AA)
+        cv2.circle(overlay, (int(nz[0]), int(nz[1])), int(0.06 * R),
+                   (255, 255, 255), -1)
+        for sgn in (-1, 1):                          # side pods
+            pd = P(0.05, sgn * 0.72)
+            cv2.circle(overlay, (int(pd[0]), int(pd[1])), int(0.2 * R),
+                       _dim(HOLO_BLUE, k(4.0 + sgn)), 1, cv2.LINE_AA)
+            cv2.circle(overlay, (int(pd[0]), int(pd[1])), int(0.08 * R),
+                       _dim(HOLO_CYAN, k(5.0 + sgn)), -1)
+        fn = P(0.22, -0.55)                          # fin
+        self._poly(overlay, fn, R * 0.4, rot, 1.0,
+                   [(-0.6, 0.0), (0.6, 0.55), (0.6, 0.0)],
+                   _dim(HOLO_CYAN, k(1.5)), fill=_dim(HOLO_BLUE, 0.12))
+        # dimension lines + part badges
+        self._dimline(overlay, hm, bl, _dim(HOLO_CYAN, 0.5))
+        self._dimline(overlay, hm, b, _dim(HOLO_CYAN, 0.5))
+        self._dimline(overlay, hm, cell, _dim(HOLO_ORANGE, 0.5))
+        self._badge(overlay, P(0.0, 0.0), 1, HOLO_CYAN, R)
+        self._badge(overlay, P(0.62, 0.06), 2, HOLO_ORANGE, R)
+        self._badge(overlay, P(-0.55, 0.0), 3, HOLO_BLUE, R)
+
+    # -- kind 2: web-fluid cartridge ----------------------------------------- #
+    def _draw_cart(self, overlay, c, R, rot, spread, t):
+        P = lambda ox, oy: self._place(c, R, rot, spread, ox, oy)  # noqa: E731
+        k = lambda a: 0.55 + 0.3 * math.sin(t * 2.0 + a)  # noqa: E731
+        body = P(0.05, 0.0)
+        self._poly(overlay, body, R * 0.8, rot, 1.0,
+                   [(-0.9, -0.55), (0.9, -0.55), (1.1, -0.35), (1.1, 0.35),
+                    (0.9, 0.55), (-0.9, 0.55), (-1.1, 0.35), (-1.1, -0.35)],
+                   _dim(HOLO_CYAN, k(0.0)), fill=_dim(HOLO_BLUE, 0.12))
+        fl = P(-0.05, 0.0)                           # fluid inside (orange blob)
+        cv2.ellipse(overlay, (int(fl[0]), int(fl[1])),
+                    (int(0.75 * R * (0.85 + 0.15 * k(2.0))), int(0.36 * R)),
+                    math.degrees(rot), 0, 360,
+                    _dim(HOLO_ORANGE, 0.5 + 0.3 * k(2.0)), 1, cv2.LINE_AA)
+        cap = P(-0.85, 0.0)                          # cap + locking ring
+        self._poly(overlay, cap, R * 0.5, rot, 1.0,
+                   [(-0.8, -0.7), (0.2, -0.7), (0.2, 0.7), (-0.8, 0.7)],
+                   _dim(HOLO_CYAN, k(1.0)))
+        cv2.ellipse(overlay, (int(cap[0]), int(cap[1])),
+                    (int(0.22 * R), int(0.5 * R)), math.degrees(rot),
+                    0, 360, _dim(HOLO_BLUE, k(1.5)), 1, cv2.LINE_AA)
+        nz = P(1.05, 0.0)                            # nozzle end
+        cv2.circle(overlay, (int(nz[0]), int(nz[1])), int(0.16 * R),
+                   HOLO_ORANGE, 1, cv2.LINE_AA)
+        cv2.circle(overlay, (int(nz[0]), int(nz[1])), int(0.07 * R),
+                   (255, 255, 255), -1)
+        for sgn in (-1, 1):                          # side clips
+            cl = P(0.3, sgn * 0.85)
+            self._poly(overlay, cl, R * 0.35, rot, 1.0,
+                       [(-0.5, -0.4), (0.5, -0.4), (0.3, 0.4), (-0.3, 0.4)],
+                       _dim(HOLO_BLUE, k(4.0 + sgn)))
+        ga = P(0.35, 0.62)                           # pressure gauge + needle
+        cv2.ellipse(overlay, (int(ga[0]), int(ga[1])),
+                    (int(0.28 * R), int(0.18 * R)), math.degrees(rot),
+                    200, 340, _dim(HOLO_CYAN, 0.8), 1, cv2.LINE_AA)
+        th = t * 2.4
+        cv2.line(overlay, (int(ga[0]), int(ga[1])),
+                 (int(ga[0] + math.cos(th) * 0.24 * R),
+                  int(ga[1] + math.sin(th) * 0.15 * R)),
+                 _dim(HOLO_ORANGE, 0.9), 1, cv2.LINE_AA)
+        self._dimline(overlay, body, cap, _dim(HOLO_CYAN, 0.5))
+        self._dimline(overlay, body, nz, _dim(HOLO_CYAN, 0.5))
+        self._dimline(overlay, body, fl, _dim(HOLO_ORANGE, 0.5))
+        self._badge(overlay, P(0.05, 0.0), 1, HOLO_CYAN, R)
+        self._badge(overlay, P(-0.85, 0.0), 2, HOLO_BLUE, R)
+        self._badge(overlay, P(1.05, 0.0), 3, HOLO_ORANGE, R)
+
+    # -- kind 3: the spider drone -------------------------------------------- #
+    def _draw_drone(self, overlay, c, R, rot, spread, t):
+        P = lambda ox, oy: self._place(c, R, rot, spread, ox, oy)  # noqa: E731
+        k = lambda a: 0.55 + 0.3 * math.sin(t * 2.0 + a)  # noqa: E731
+        body = P(0.0, 0.0)
+        cv2.ellipse(overlay, (int(body[0]), int(body[1])),
+                    (int(0.55 * R), int(0.38 * R)), math.degrees(rot),
+                    0, 360, _dim(HOLO_CYAN, k(0.0)), 1, cv2.LINE_AA)
+        cv2.ellipse(overlay, (int(body[0]), int(body[1])),
+                    (int(0.30 * R), int(0.18 * R)), math.degrees(rot),
+                    0, 360, _dim(HOLO_CYAN, 0.9), 1, cv2.LINE_AA)
+        head = P(0.62, 0.0)                          # head + red eye lenses
+        cv2.ellipse(overlay, (int(head[0]), int(head[1])),
+                    (int(0.28 * R), int(0.22 * R)), math.degrees(rot),
+                    0, 360, _dim(HOLO_CYAN, k(1.0)), 1, cv2.LINE_AA)
+        for sgn in (-1, 1):
+            eye = P(0.68, sgn * 0.10)
+            cv2.ellipse(overlay, (int(eye[0]), int(eye[1])),
+                        (int(0.10 * R), int(0.06 * R)), math.degrees(rot) + 20 * sgn,
+                        0, 360, _dim(RED, 0.9), 1, cv2.LINE_AA)
+            cv2.circle(overlay, (int(eye[0]), int(eye[1])),
+                       max(1, int(0.03 * R)), _dim(RED, 0.7), -1)
+        for i, (ox, oy, sgn) in enumerate(((-0.25, -0.6, -1), (-0.1, -0.75, -1),
+                                           (-0.25, 0.6, 1), (-0.1, 0.75, 1))):
+            wig = math.sin(t * 4.0 + i) * 0.25 + (spread * 2.0 if spread < 0.5 else 0.0)
+            base = P(ox, oy)
+            mid = P(ox - 0.5 - 0.25 * math.cos(wig), oy + 0.25 * sgn)
+            end = P(ox - 1.0 - 0.5 * math.cos(wig), oy + 0.1 * sgn)
+            cv2.polylines(overlay,
+                          [np.array([[int(base[0]), int(base[1])],
+                                     [int(mid[0]), int(mid[1])],
+                                     [int(end[0]), int(end[1])]], np.int32)],
+                          False, _dim(HOLO_CYAN, k(2.0 + i)), 2, cv2.LINE_AA)
+        for i, ox in enumerate((-0.55, -0.35, -0.15)):   # spinnerets
+            sp = P(ox, 0.0)
+            cv2.circle(overlay, (int(sp[0]), int(sp[1])),
+                       int(0.05 * R), _dim(HOLO_ORANGE, k(3.0 + i)), 1, cv2.LINE_AA)
+        an = P(0.75, -0.35)                          # antenna
+        cv2.line(overlay, (int(an[0]), int(an[1])),
+                 (int(an[0] + math.cos(rot - 0.5) * 0.3 * R),
+                  int(an[1] + math.sin(rot - 0.5) * 0.3 * R)),
+                 _dim(HOLO_CYAN, 0.8), 1)
+        self._dimline(overlay, body, head, _dim(HOLO_CYAN, 0.5))
+        self._dimline(overlay, body, P(-0.35, 0.0), _dim(HOLO_ORANGE, 0.5))
+        self._badge(overlay, P(0.0, 0.0), 1, HOLO_CYAN, R)
+        self._badge(overlay, P(0.62, 0.0), 2, HOLO_BLUE, R)
+        self._badge(overlay, P(-0.35, 0.0), 3, HOLO_ORANGE, R)
+
+
+
+
+# --------------------------------------------------------------------------- #
 # Camera / sources
 # --------------------------------------------------------------------------- #
 def open_camera(index: int | None):
@@ -920,6 +1202,7 @@ def run(args: argparse.Namespace) -> int:
 
     tracker = GestureTracker()
     holo = WebShooterHologram()
+    blueprint = None
     frame_idx = 0
     last_ts = 0
     fps = 30.0
@@ -998,7 +1281,15 @@ def run(args: argparse.Namespace) -> int:
             now = t0
             events = tracker.feed(feats, now)
             for evt, payload in events:
-                if evt == "grab":
+                if evt == "spawn" and payload is not None:
+                    w, h = frame.shape[1], frame.shape[0]
+                    px = payload["palm"] * np.array([w, h])
+                    L = float(np.linalg.norm(
+                        (payload["mcp9"] - payload["wrist"]) * np.array([w, h])))
+                    blueprint = GadgetBlueprint(px, 1.35 * L,
+                                                np.random.default_rng())
+                    print("[gesture] gadget blueprint")
+                elif evt == "grab":
                     holo.grab(payload, frame.shape[1], frame.shape[0], now)
                     print("[gesture] grab ->", holo.state)
                 elif evt == "release":
@@ -1016,6 +1307,11 @@ def run(args: argparse.Namespace) -> int:
                 draw_hand_holo(frame, right_feat["landmarks"])
             holo.update(dt, now, right_feat, frame.shape[1], frame.shape[0])
             holo.draw(frame, now)
+            if blueprint is not None:
+                blueprint.update(dt)
+                blueprint.draw(frame)
+                if not blueprint.alive():
+                    blueprint = None
 
             if recorder is not None:        # recording: red dot only, no text
                 cv2.circle(frame, (frame.shape[1] - 42, 30), 8, (0, 0, 255), -1)
