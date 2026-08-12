@@ -34,6 +34,10 @@ if errorlevel 1 (
 )
 
 rem ---------- 3. run -------------------------------------------------------
-echo [run] Starting Hologram Studio.
+echo [run] Hologram Studio - show your hands to the camera.
+echo       Right-hand PINCH = take the web-shooter off / put it back on
+echo       FIST then OPEN   = holographic gadget blueprint
+echo       BOTH FISTS then OPEN = toggle holographic body gear
+echo       V = record,  R = gear (keyboard),  Esc = quit.
 "%PY%" hand_zoom.py %*
 pause
