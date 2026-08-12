@@ -1,0 +1,12 @@
+# virtual environment + caches
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# downloaded model (fetched at first run by ensure_model())
+models/
+*.tmp
+
+# recordings + previews
+recordings/

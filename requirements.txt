@@ -1,0 +1,6 @@
+# hand_zoom dependencies
+# mediapipe 1.0.0 is pinned: it ships a py3-none-win_amd64 wheel that also
+# installs on Python 3.13 / 3.14 (older 0.10.x releases only support <=3.12).
+mediapipe==1.0.0
+opencv-python>=4.10
+numpy>=1.26,<3
