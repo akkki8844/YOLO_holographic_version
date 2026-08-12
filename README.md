@@ -1,21 +1,20 @@
 # 🕷️ Hologram Studio — Tony Stark tech, driven by your hands
 
 Point your webcam at your hands and a futuristic, Tony-Stark-style **hologram
-suite** comes to life — all drawn as see-through "hard-light" projections.
-No mouse, no keyboard, no input injection. Every feature is triggered by a
-hand gesture.
+suite** comes to life — every hologram rendered in electric-blue hard-light
+(you'll also see the blue **skeleton tracing** on every tracked hand, so you
+know exactly when you're recognised). No mouse, no keyboard, no input
+injection. Every feature is triggered by a hand gesture.
 
 ## The gestures (final list)
 
 | Gesture | What happens |
 |---|---|
-| **Show your right hand** | A holographic **web-shooter** materialises on your wrist — three concentric rings, arc-reactor core, web-fluid cartridge with a draining gauge, floating HUD panels, orbiting particles, scanlines and a soft flicker. It follows your hand in real time. |
-| **Right-hand PINCH** (thumb + index + middle together) | **Take the web-shooter OFF your wrist.** Snap-threads stretch and break, a shockwave flare bursts, and the shooter floats in your pinch, following your hand. Let go and it **stays floating in mid-air**, gently bobbing. |
-| **PINCH again while it's floating** | The shooter **flies back onto your wrist** with a glowing streak trail. |
-| **FIST, hold ~0.5 s, then OPEN** | A holographic **gadget blueprint** appears — an animated exploded-view breakdown of one of Spider-Man's gadgets (web-shooter Mark V, web-fluid cartridge, or spider drone). Parts assemble, explode, and reassemble in a loop; dimension lines and part badges label the pieces. It fades out after a few seconds. |
-| **BOTH FISTS, hold ~0.6 s, then OPEN** | Toggles holographic **body gear**: Iron-Man-style gauntlets on both wrists (segmented armour plates, palm arc reactor, knuckle nodes, energy veins, orbiting motes) plus a chest arc reactor between the hands whenever both are visible. |
+| **PINCH (thumb + index + middle) and PULL** | The pinch grabs hard-light out of the air and a **3D web-shooter flies onto the OPPOSITE wrist** — pinch-pull with your **right** hand and it lands on your **left** wrist, and vice versa. It arrives as a wireframe, solidifies on landing, then tracks that wrist in full shaded 3D. Pinch-pull again to send it away. |
+| **ONE FIST, hold ~0.45 s** | A **detailed exploded blueprint of the web-shooter** materialises on the opposite side of the screen: real 3D geometry rotating in space, cycling assemble → hold → explode, with leader-line callouts for all seven parts, a dimension line across the assembly and a live spec block. The same gesture dismisses it. |
+| **BOTH FISTS, hold 1.0 s** | The **whole suit** builds onto you: torso shell, spider emblem, classic webbing, shoulder plates, belt, and an armoured **gauntlet on each wrist** — materialising bottom-to-top from wireframe to solid. **Never a mask.** Hold both fists again to take it off. |
+| **GRAB an object and HOLD 4 s** | A lock ring charges around whatever you grabbed (a shooter, the blueprint) with a ticking countdown. When it snaps **READY**, the object follows your hand. Release and it simply **stays where you left it** — nothing else happens. |
 | `V` | Start / stop recording the preview to `recordings/`. |
-| `R` | Toggle body gear from the keyboard (handy for testing). |
 | `Esc` / `Q` | Quit. |
 
 Open `preview_*.png` in this folder (generated on a sample photo) to see the
@@ -34,9 +33,11 @@ scene.
   **EMA-smoothed per hand** (hands are matched frame-to-frame by palm
   position), with hysteresis and frame-confirmation so jitter never trips a
   gesture. If a hand drops out for a few frames, its state is **ghosted** so a
-  tracking hiccup can't cancel a held gesture.
+  tracking hiccup can't cancel a held gesture. The both-fists gear clock also
+  survives one-frame flickers.
 - **Both hands tracked** — right/left is decided by MediaPipe's handedness
-  (mirrored/selfie input), with a mirrored-frame position fallback.
+  (mirrored/selfie input), with a mirrored-frame position fallback; a lone
+  hand is never mislabelled.
 - **Self-explanatory logs** — `--verbose` shows how many hands are tracked
   every second; the gesture guide is printed to the console on startup.
 
@@ -93,8 +94,8 @@ launches the app.
   (`min_hand_detection_confidence 0.10`, `min_hand_presence_confidence 0.10`,
   `min_tracking_confidence 0.20`), 2 hands.
 - **Gestures** — `GestureTracker` turns smoothed per-hand features into
-  discrete events: `spawn` (fist → open), `grab`/`release` (right-hand
-  pinch), `gear` (both fists → open).
+  discrete events: `spawn` (fist → open), `grab`/`release` (pinch on either
+  hand), `gear` (both fists → open).
 - **Rendering** — `WebShooterHologram` (on-wrist / detaching / held /
   floating / reattaching states), `GadgetBlueprint` (exploded-view
   breakdowns), and `BodyGear` (gauntlets + chest reactor). All pure 2D
