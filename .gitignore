@@ -10,3 +10,6 @@ models/
 
 # recordings + previews
 recordings/
+
+# local Unity Capture driver download (re-fetched by setup_virtualcam.bat)
+tools/

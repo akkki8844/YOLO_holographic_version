@@ -26,35 +26,26 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [2/3] Downloading the Unity Capture driver...
-powershell -NoProfile -Command "$ErrorActionPreference='Stop'; $r = Invoke-RestMethod -Uri 'https://api.github.com/repos/schellingb/UnityCapture/releases/latest'; $a = $r.assets | Where-Object { $_.name -like '*.zip' } | Select-Object -First 1; if (-not $a) { throw 'No zip asset found in the latest release' }; New-Item -ItemType Directory -Force -Path 'tools' | Out-Null; Invoke-WebRequest -Uri $a.browser_download_url -OutFile 'tools\UnityCapture.zip'"
-if errorlevel 1 (
-    echo.
-    echo Download failed - check your internet connection, then re-run.
-    pause
-    exit /b 1
-)
-powershell -NoProfile -Command "$ErrorActionPreference='Stop'; Expand-Archive -Path 'tools\UnityCapture.zip' -DestinationPath 'tools\UnityCapture' -Force"
-if errorlevel 1 (
-    echo.
-    echo Could not extract the driver archive.
-    pause
-    exit /b 1
-)
+echo [2/3] Downloading the Unity Capture driver (pre-built DLLs from GitHub)...
+mkdir tools\UnityCapture 2>nul
+curl -sL --max-time 60 -o "tools\UnityCapture\UnityCaptureFilter32.dll" "https://raw.githubusercontent.com/schellingb/UnityCapture/master/Install/UnityCaptureFilter32.dll"
+if errorlevel 1 goto download_failed
+curl -sL --max-time 60 -o "tools\UnityCapture\UnityCaptureFilter64.dll" "https://raw.githubusercontent.com/schellingb/UnityCapture/master/Install/UnityCaptureFilter64.dll"
+if errorlevel 1 goto download_failed
+for %%F in ("tools\UnityCapture\UnityCaptureFilter64.dll") do if %%~zF LSS 50000 goto download_failed
+echo       downloaded: tools\UnityCapture\UnityCaptureFilter32.dll
+echo                  : tools\UnityCapture\UnityCaptureFilter64.dll
+goto registered
 
-rem locate Install.bat inside the extracted driver
-set "INSTALL_BAT="
-for /r "tools\UnityCapture" %%f in (Install.bat) do if not defined INSTALL_BAT set "INSTALL_BAT=%%f"
-if not defined INSTALL_BAT (
-    echo.
-    echo Could not find Install.bat in tools\UnityCapture.
-    echo Open that folder and run Install.bat as administrator manually.
-    pause
-    exit /b 1
-)
+:download_failed
+echo.
+echo Download failed - check your internet connection, then re-run.
+pause
+exit /b 1
 
+:registered
 echo [3/3] Registering the driver - click Yes on the administrator prompt...
-powershell -NoProfile -Command "$f = '%INSTALL_BAT%'; Start-Process -FilePath $f -Verb RunAs -WorkingDirectory (Split-Path $f)"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $script = \"@echo off`r`ncd /d `\"%~dp0tools\UnityCapture`\"`r`nregsvr32 /s UnityCaptureFilter32.dll`r`nregsvr32 /s UnityCaptureFilter64.dll`r`n\"; $bat = Join-Path $env:TEMP 'uc_register.bat'; [System.IO.File]::WriteAllText($bat, $script, (New-Object System.Text.ASCIIEncoding)); Start-Process -FilePath $bat -Verb RunAs -Wait"
 if errorlevel 1 (
     echo.
     echo The administrator prompt was declined. Run this file again and click Yes.
