@@ -41,12 +41,14 @@ def brackets(img, c, r, colour, thick=1, gap=0.30):
 
 
 class Hud:
-    """Persistent HUD state (rolling telemetry traces)."""
+    """The screen furniture.
 
-    def __init__(self):
-        self._wave = np.zeros(96)
-        self._rng = np.random.default_rng(5)
-        self._meters = self._rng.uniform(0.0, 2 * math.pi, 4)
+    Everything here reports something real: what is equipped, what gesture is
+    charging, how the tracking is doing.  The decorative analytics that used to
+    live on this HUD - the radar, the PWR/WEB/SYNC meters and the rolling
+    "gesture bus" trace - were invented numbers that only ate the frame, so
+    they are gone.
+    """
 
     # -- public -------------------------------------------------------------- #
     def draw(self, frame, ctx: dict) -> None:
@@ -57,8 +59,6 @@ class Hud:
         t = float(ctx.get("t", 0.0))
         self._frame_furniture(ov, w, h, t)
         self._top_bar(ov, w, h, t, ctx)
-        self._left_rail(ov, w, h, t, ctx)
-        self._radar(ov, w, h, t, ctx)
         self._bottom(ov, w, h, t, ctx)
         self._hands(ov, w, h, t, ctx)
         self._drags(ov, t, ctx)
@@ -93,75 +93,13 @@ class Hud:
         hands = int(ctx.get("hand_count", 0))
         right = f"{stamp}   {fps:4.1f} FPS   HANDS {hands}/2"
         text(ov, right, (w - 28 - 8 * len(right) * 0.62, 40), 0.42, col)
-        # sweeping progress line under the title
-        p = (t * 0.35) % 1.0
-        x0 = w - 28 - 300
-        cv2.line(ov, (x0, 52), (w - 28, 52), dim(HOLO_DIM, 0.9), 1)
-        cv2.line(ov, (int(x0 + 300 * p) - 26, 52), (int(x0 + 300 * p), 52),
-                 dim(HOLO_WHITE, 0.8), 2)
-
-    def _left_rail(self, ov, w, h, t, ctx):
-        names = ("PWR", "WEB", "SYNC", "TRK")
-        vals = (0.72 + 0.2 * math.sin(t * 1.1 + self._meters[0]),
-                0.55 + 0.3 * math.sin(t * 0.7 + self._meters[1]),
-                0.80 + 0.15 * math.sin(t * 1.9 + self._meters[2]),
-                clamp01(ctx.get("hand_count", 0) / 2.0) * 0.95 + 0.05)
-        y0 = int(h * 0.34)
-        for i, (n, v) in enumerate(zip(names, vals)):
-            y = y0 + i * 30
-            text(ov, n, (30, y + 5), 0.36, dim(HOLO_BLUE, 0.95))
-            cv2.rectangle(ov, (72, y - 7), (72 + 120, y + 3), dim(HOLO_DIM, 0.9), 1)
-            cv2.rectangle(ov, (73, y - 6), (int(73 + 118 * clamp01(v)), y + 2),
-                          dim(HOLO_CYAN, 0.55), -1)
-            for s in range(1, 4):                     # tick marks
-                x = 72 + int(120 * s / 4)
-                cv2.line(ov, (x, y - 7), (x, y - 4), dim(HOLO_BLUE, 0.9), 1)
-        # vertical ladder with a travelling marker
-        lx = 22
-        cv2.line(ov, (lx, y0 - 40), (lx, y0 + 190), dim(HOLO_DIM, 0.9), 1)
-        for i in range(12):
-            y = y0 - 40 + i * 21
-            cv2.line(ov, (lx, y), (lx + (7 if i % 3 else 13), y), dim(HOLO_BLUE, 0.8), 1)
-        my = y0 - 40 + int(230 * (0.5 + 0.5 * math.sin(t * 0.8)))
-        cv2.line(ov, (lx - 4, my), (lx + 16, my), dim(HOLO_WHITE, 0.9), 2, cv2.LINE_AA)
-
-    def _radar(self, ov, w, h, t, ctx):
-        cx, cy, r = w - 96, int(h * 0.40), 60
-        for k in (1.0, 0.66, 0.33):
-            cv2.circle(ov, (cx, cy), int(r * k), dim(HOLO_BLUE, 0.55), 1, cv2.LINE_AA)
-        cv2.line(ov, (cx - r, cy), (cx + r, cy), dim(HOLO_DIM, 0.9), 1)
-        cv2.line(ov, (cx, cy - r), (cx, cy + r), dim(HOLO_DIM, 0.9), 1)
-        a = (t * 1.6) % (2 * math.pi)
-        for i in range(14):                            # fading sweep tail
-            aa = a - i * 0.05
-            k = 1.0 - i / 14.0
-            cv2.line(ov, (cx, cy), (int(cx + math.cos(aa) * r), int(cy + math.sin(aa) * r)),
-                     dim(HOLO_CYAN, 0.55 * k), 1, cv2.LINE_AA)
-        for hnd in ctx.get("hands", []):
-            px, py = hnd["palm"]
-            bx = cx + (px - 0.5) * 2.0 * r * 0.85
-            by = cy + (py - 0.5) * 2.0 * r * 0.85
-            cv2.circle(ov, (int(bx), int(by)), 4, dim(HOLO_WHITE, 0.9), -1, cv2.LINE_AA)
-            cv2.circle(ov, (int(bx), int(by)), 8, dim(HOLO_CYAN, 0.5), 1, cv2.LINE_AA)
-        text(ov, "TRACK", (cx - 22, cy + r + 18), 0.34, dim(HOLO_BLUE, 0.9))
 
     def _bottom(self, ov, w, h, t, ctx):
-        # rolling telemetry trace
-        self._wave = np.roll(self._wave, -1)
-        self._wave[-1] = (math.sin(t * 6.0) * 0.5 + math.sin(t * 2.3) * 0.3
-                          + (0.6 if ctx.get("hand_count") else 0.0)
-                          * math.sin(t * 17.0) * 0.25)
-        bx, by, bw, bh = 28, h - 56, 260, 34
-        cv2.rectangle(ov, (bx, by - bh // 2), (bx + bw, by + bh // 2),
-                      dim(HOLO_DIM, 0.8), 1)
-        pts = [(bx + int(i * bw / (len(self._wave) - 1)), int(by - v * bh * 0.45))
-               for i, v in enumerate(self._wave)]
-        cv2.polylines(ov, [np.array(pts, np.int32)], False, dim(HOLO_CYAN, 0.85), 1,
-                      cv2.LINE_AA)
-        text(ov, "GESTURE BUS", (bx, by - bh // 2 - 7), 0.32, dim(HOLO_BLUE, 0.9))
-        # status chips
+        # status chips: the only readout on screen, and every one of them is
+        # real equipment state
+        by = h - 74
         chips = ctx.get("chips", [])
-        x = bx + bw + 24
+        x = 28
         for label, lit, prog in chips:
             wlab = int(9.2 * len(label)) + 18
             c = dim(HOLO_CYAN, 0.95) if lit else dim(HOLO_DEEP, 0.75)
@@ -174,9 +112,10 @@ class Hud:
                 cv2.rectangle(ov, (x, by + 13), (x + int(wlab * clamp01(prog)), by + 16),
                               dim(HOLO_WHITE, 0.85), -1)
             x += wlab + 12
-        legend = ("PINCH+PULL = SHOOTER ON OTHER WRIST   |   FIST = BLUEPRINT   |   "
-                  "BOTH FISTS 1s = SUIT   |   HOLD GRAB 4s = MOVE")
-        text(ov, legend, (28, h - 18), 0.34, dim(HOLO_BLUE, 0.85))
+        text(ov, "PINCH+PULL = SHOOTER ON OTHER WRIST   |   PINCH A WORN SHOOTER"
+                 " + PULL = TAKE IT OFF", (28, h - 38), 0.34, dim(HOLO_BLUE, 0.85))
+        text(ov, "FIST = BLUEPRINT   |   BOTH FISTS 1s = SUIT   |   "
+                 "HOLD GRAB 4s = MOVE", (28, h - 20), 0.34, dim(HOLO_BLUE, 0.85))
 
     def _hands(self, ov, w, h, t, ctx):
         for hnd in ctx.get("hands", []):

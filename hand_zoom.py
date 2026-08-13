@@ -13,11 +13,20 @@ Gestures
                                                onto the LEFT wrist, and vice
                                                versa.  Pinch-pull again to send
                                                that shooter away.
+  PINCH A WORN SHOOTER and PULL ............... take it off.  Reach over,
+                                               pinch the shooter sitting on
+                                               your wrist and pull, exactly as
+                                               you would strip a real one off:
+                                               it detaches on the spot, becomes
+                                               its own object in your hand and
+                                               stays wherever you drop it.
   ONE FIST, hold ~0.45 s ...................... a detailed exploded 3D
-                                               BLUEPRINT of the web-shooter,
-                                               docked opposite the fist, with
-                                               callouts and dimensions.  Same
-                                               gesture again dismisses it.
+                                               BLUEPRINT of the web-shooter in
+                                               black and white, docked opposite
+                                               the fist, with callouts and
+                                               dimensions.  It holds still so
+                                               it can be read.  Same gesture
+                                               again dismisses it.
   BOTH FISTS, hold 1.0 s ...................... the full holographic suit -
                                                torso, spider emblem, webbing,
                                                shoulders, belt and an armoured
@@ -267,13 +276,24 @@ def hand_features(landmarks, is_right: bool) -> dict:
     }
 
 
+MIRROR_HANDEDNESS = True    # see classify_hands()
+
+
 def classify_hands(result) -> list:
     """Turn a detection result into a list of per-hand feature dicts.
 
-    Every hand gets an 'is_right' flag: MediaPipe's handedness when present
-    (mirrored/selfie input, which is exactly what the webcam pipeline feeds
-    it); otherwise the mirrored-frame position fallback (rightmost = the
-    user's right hand).
+    Every hand gets an 'is_right' flag.
+
+    MediaPipe's own handedness label is reported for the image as given to it,
+    and this pipeline hands it a horizontally FLIPPED frame (the mirrored
+    selfie view, which is the only view that feels natural to gesture into).
+    In that frame the user's right hand is on the right of the picture, which
+    the model reads as a left hand - so its labels arrive inverted and are
+    swapped back here.  Getting this wrong is very visible: the shooter lands
+    on the wrist that summoned it instead of the opposite one.
+
+    Without handedness, the position fallback applies (in the mirrored frame
+    the rightmost hand is the user's right hand).
     """
     hands = list(result.hand_landmarks or []) if result is not None else []
     if not hands:
@@ -288,6 +308,8 @@ def classify_hands(result) -> list:
         if i < len(hd) and hd[i]:
             cat = hd[i][0]
             name = str(getattr(cat, "category_name", "") or "")
+            if MIRROR_HANDEDNESS and name:      # un-mirror: see the docstring
+                name = "Left" if name.lower().startswith("r") else "Right"
         labels.append(name)
     if not any(labels):
         order = sorted(range(len(hands)), key=lambda i: -hands[i][0].x)
@@ -303,22 +325,37 @@ def draw_hand_holo(overlay, hand, k: float = 1.0, t: float = 0.0) -> None:
     This is the user's recognition feedback, so it stays clearly visible and
     pulses gently instead of sitting static - but it is deliberately dimmer
     than the hardware so it never fights the holograms for attention.
+
+    The landmarks carry a depth channel, so the skeleton is drawn as a real 3D
+    wire model rather than a flat tracing: joints reaching toward the camera
+    are fatter and brighter, joints behind the palm recede.  Tilt your hand and
+    you can see it turn in space.
     """
     h, w = overlay.shape[0] / k, overlay.shape[1] / k
     pts = [(lm.x * w * k, lm.y * h * k) for lm in hand]
+    # depth relative to the wrist, in hand-lengths; +ve = toward the camera
+    span = math.hypot(hand[MIDDLE_MCP].x - hand[WRIST].x,
+                      hand[MIDDLE_MCP].y - hand[WRIST].y) + 1e-6
+    zs = [clamp01(0.5 + (hand[WRIST].z - lm.z) / (2.4 * span)) for lm in hand]
     pulse = 0.85 + 0.15 * math.sin(t * 3.1)
     for a, b in HAND_CONNECTIONS:
         pa = (int(pts[a][0]), int(pts[a][1]))
         pb = (int(pts[b][0]), int(pts[b][1]))
-        cv2.line(overlay, pa, pb, _dim(HOLO_DEEP, 0.55 * pulse), 3, cv2.LINE_AA)
-        cv2.line(overlay, pa, pb, _dim(HOLO_CYAN, 0.55), 1, cv2.LINE_AA)
+        z = 0.5 * (zs[a] + zs[b])
+        cv2.line(overlay, pa, pb, _dim(HOLO_DEEP, (0.30 + 0.50 * z) * pulse),
+                 2 + int(round(2 * z)), cv2.LINE_AA)
+        cv2.line(overlay, pa, pb, _dim(HOLO_CYAN, 0.28 + 0.55 * z), 1, cv2.LINE_AA)
     for i, p in enumerate(pts):
         c = (int(p[0]), int(p[1]))
+        z = zs[i]
         if i in (THUMB_TIP, INDEX_TIP, MIDDLE_TIP, 16, 20):  # fingertips glow
-            cv2.circle(overlay, c, 3, _dim(HOLO_CYAN, 0.85 * pulse), -1, cv2.LINE_AA)
-            cv2.circle(overlay, c, 5, _dim(HOLO_BLUE, 0.30 * pulse), 1, cv2.LINE_AA)
+            cv2.circle(overlay, c, 2 + int(round(3 * z)),
+                       _dim(HOLO_CYAN, (0.5 + 0.5 * z) * pulse), -1, cv2.LINE_AA)
+            cv2.circle(overlay, c, 4 + int(round(4 * z)),
+                       _dim(HOLO_BLUE, (0.18 + 0.3 * z) * pulse), 1, cv2.LINE_AA)
         else:
-            cv2.circle(overlay, c, 2, _dim(HOLO_CYAN, 0.55 * pulse), -1, cv2.LINE_AA)
+            cv2.circle(overlay, c, 1 + int(round(2 * z)),
+                       _dim(HOLO_CYAN, (0.3 + 0.4 * z) * pulse), -1, cv2.LINE_AA)
 
 
 # --------------------------------------------------------------------------- #
@@ -579,14 +616,24 @@ class HoloDesk:
     def on_pull(self, feat, w, h, t):
         side = self._side(feat)
         d = self.drags.get(side)
+        px = pinch_px(feat, w, h)
         if d is not None and d["obj"] is not None:
+            obj = d["obj"]
+            # Pinching a shooter that is WORN and pulling takes it off, exactly
+            # the way you would strip one off your wrist.  It detaches straight
+            # away - no move-lock countdown - and from here on it is its own
+            # object: it follows the pinch and stays where it is dropped.
+            if isinstance(obj, WebShooter) and obj.detach(t, px):
+                d["armed"] = True
+                d["armed_t"] = t
+                self._log(f"[gesture] pulled the {obj.side} shooter off - detached")
             return                                  # this pinch is a grab, not a pull
         target = "Left" if feat["is_right"] else "Right"
         # If that wrist is off-camera the shooter waits at the edge of the
         # frame on its own side - never floating in the middle of the view.
         park = (0.11 * w if target == "Left" else 0.89 * w, 0.34 * h)
         sh = self.shooters[target]
-        what = sh.toggle(t, pinch_px(feat, w, h), park)
+        what = sh.toggle(t, px, park)
         self._log(f"[gesture] pinch-pull {side} -> {target} wrist shooter {what}")
 
     def on_unpinch(self, feat, w, h, t):
@@ -1202,14 +1249,24 @@ def selftest(args: argparse.Namespace) -> int:
         bp.draw(half, 0.5, i / 30.0)
         assert half.any(), "blueprint must draw pixels"
     full = np.zeros((480, 640, 3), np.uint8)
-    bp.draw(np.zeros((240, 320, 3), np.uint8), 0.5, 1.4)
-    bp.annotate(full, 1.4)
+    mono = np.zeros((240, 320, 3), np.uint8)
+    bp.draw(mono, 0.5, 1.4)
+    b, r = float(mono[:, :, 0].sum()), float(mono[:, :, 2].sum())
+    assert abs(b - r) < 0.04 * max(b, 1.0), \
+        "the blueprint is a BLACK AND WHITE hologram - no colour cast"
+    rot_a = bp._rot.copy()                     # ...and it must not spin
+    for _ in range(90):
+        bp.update(1 / 30.0)
+    bp.draw(np.zeros((240, 320, 3), np.uint8), 0.5, 4.4)
+    assert np.abs(bp._rot - rot_a).max() < 0.15, \
+        "the blueprint must hold its view, not rotate"
+    bp.annotate(full, 4.4)
     assert full.any(), "blueprint must draw its callouts at full resolution"
     bp.dismiss()
     for _ in range(20):
         bp.update(1 / 30.0)
     assert not bp.alive(), "a dismissed blueprint must expire"
-    print("[ok] blueprint: exploded 3D view, callouts, dismissal")
+    print("[ok] blueprint: black-and-white exploded view, holds still, callouts")
 
     # 7. suit: draws torso + gauntlets from the visible hands, never a head
     suit = SuitGear(0.0)
@@ -1288,6 +1345,34 @@ def selftest(args: argparse.Namespace) -> int:
     assert desk.shooters["Left"].state == "dismiss", "pulling again sends it away"
     print("[ok] desk: pinch-pull equips the OPPOSITE wrist, again to dismiss")
 
+    # 10b. pinching a WORN shooter and pulling takes it off, then it stays put
+    desk3 = HoloDesk(log=lambda *a: None)
+    lf2 = _fake_feat(False, pinch3=0.10, hand_id=0.4)
+    desk3.handle([("pinch", lf2), ("pull", lf2)], 640, 480, 0.0)
+    sh_r = desk3.shooters["Right"]
+    for i in range(30):                        # let it fly on and mount
+        desk3.update(1 / 30.0, i / 30.0, [right], 640, 480)
+    assert sh_r.state == "on", f"the shooter must be worn first (got {sh_r.state})"
+    worn = sh_r.pos
+    grab2 = _fake_feat(True, pinch3=0.10)      # reach over and pinch it
+    grab2["thumb_tip"] = np.array([worn[0] / 640.0, worn[1] / 480.0])
+    grab2["index_tip"] = grab2["thumb_tip"].copy()
+    desk3.handle([("pinch", grab2)], 640, 480, 1.0)
+    assert desk3.drags["Right"]["obj"] is sh_r, "the pinch must catch the worn shooter"
+    desk3.handle([("pull", grab2)], 640, 480, 1.02)
+    assert sh_r.state == "held", "pulling a worn shooter must take it off at once"
+    off = _fake_feat(True, pinch3=0.10)
+    off["thumb_tip"] = np.array([0.25, 0.25])
+    off["index_tip"] = off["thumb_tip"].copy()
+    desk3.update(1 / 30.0, 1.1, [off], 640, 480)
+    assert abs(sh_r.pos[0] - worn[0]) > 40.0, "a detached shooter follows the hand"
+    desk3.handle([("unpinch", off)], 640, 480, 1.2)
+    dropped = sh_r.pos
+    desk3.update(1 / 30.0, 1.3, [right], 640, 480)
+    assert sh_r.state == "float", "a detached shooter must not jump back on"
+    assert abs(sh_r.pos[0] - dropped[0]) < 1.0, "it stays where it was dropped"
+    print("[ok] desk: pinch a worn shooter + pull -> it comes off as its own object")
+
     # 11. desk: a 4 s grab arms the move lock, then the object follows the hand
     desk2 = HoloDesk(log=lambda *a: None)
     desk2.handle([("fist", _fake_feat(True, fist=True))], 640, 480, 0.0)
@@ -1325,7 +1410,7 @@ def selftest(args: argparse.Namespace) -> int:
     desk2.draw(frame, 3.0, feats, tr5, 30.0)
     assert frame.any(), "the HUD must draw"
     assert frame[:, :, 0].sum() > frame[:, :, 2].sum(), "the HUD must stay blue"
-    print("[ok] HUD renders (brackets, radar, meters, chips) and stays blue")
+    print("[ok] HUD renders (brackets, gesture charge, equipment chips), stays blue")
 
     # 13. virtual camera: works when a backend exists, degrades gracefully
     vc = VirtualCam.try_create(320, 240, 30.0, backend="unitycapture")

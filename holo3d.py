@@ -25,6 +25,13 @@ HOLO_BLUE = (255, 150, 40)       # deep blue body fill
 HOLO_DEEP = (170, 95, 25)        # shadow-side blue
 HOLO_DIM = (120, 80, 35)         # faded blue for depth layers
 
+# Monochrome set - used ONLY by the blueprint, which is a black-and-white
+# drafting hologram rather than part of the blue hard-light kit.
+MONO_WHITE = (252, 252, 252)
+MONO_GREY = (176, 176, 176)
+MONO_FILL = (86, 86, 86)
+MONO_DIM = (54, 54, 54)
+
 
 def clamp01(x: float) -> float:
     return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
@@ -245,7 +252,13 @@ class Mesh:
 # --------------------------------------------------------------------------- #
 # Projection + rendering
 # --------------------------------------------------------------------------- #
-DEPTH = 4.4          # camera distance in model units
+# Camera distance in model units.  FOCAL fixes the on-screen size; DEPTH alone
+# controls how strong the perspective is - the closer the camera sits, the more
+# the near face of an object flares out over the far one.  Pulled in from 4.4 so
+# every model reads as a solid with real depth instead of a flat blue decal.
+# (3.5 rather than lower: past about 3.2 the near faces flare out so far that
+# the models cost twice as much to fill for very little extra depth.)
+DEPTH = 3.5
 FOCAL = 0.66
 
 
@@ -294,10 +307,17 @@ def render_mesh(dst, mesh: Mesh, centre, scale: float, rot: np.ndarray, *,
     nrm = nrm / ln[:, None]
     lam = nrm @ _LIGHT
     facing = nrm[:, 2]
-    inten = (0.18 + 0.82 * np.abs(lam)) * mesh.FS
-    inten = np.where(facing > 0.0, inten, inten * 0.40)
-    rim = 1.0 - np.abs(facing)
     depth = vr[fi][:, :, 2].mean(axis=1)
+    # Depth cue + specular glint.  Flat Lambert alone makes a mesh look like a
+    # sticker: with the far side of the object visibly receding into the dark
+    # and a hard highlight riding the near edges, the same geometry reads as a
+    # solid you could walk around.
+    dcue = np.clip(0.5 + depth / (2.0 * mesh.radius), 0.0, 1.0)
+    spec = np.clip(lam, 0.0, 1.0) ** 14
+    inten = (0.12 + 0.74 * np.abs(lam) + 0.55 * spec) * mesh.FS
+    inten *= 0.52 + 0.78 * dcue
+    inten = np.where(facing > 0.0, inten, inten * 0.34)
+    rim = 1.0 - np.abs(facing)
     area = 0.5 * np.abs((quads[:, 2, 0] - quads[:, 0, 0]) * (quads[:, 3, 1] - quads[:, 1, 1])
                         - (quads[:, 3, 0] - quads[:, 1, 0]) * (quads[:, 2, 1] - quads[:, 0, 1]))
     xs0, xs1 = quads[:, :, 0].min(axis=1), quads[:, :, 0].max(axis=1)
@@ -309,7 +329,7 @@ def render_mesh(dst, mesh: Mesh, centre, scale: float, rot: np.ndarray, *,
         return None
     fcol = np.clip(np.asarray(fill, float)[None, :]
                    * (inten * alpha * (1.0 - clamp01(wire)))[:, None], 0, 255)
-    ek = (0.22 + 0.42 * inten + 0.45 * rim + hot) * alpha
+    ek = (0.16 + 0.40 * inten + 0.50 * rim * (0.45 + 0.55 * dcue) + hot) * alpha
     ecol = np.clip(np.asarray(edge, float)[None, :] * ek[:, None], 0, 255)
     ipts = quads.astype(np.int32)
     order = np.argsort(depth)

@@ -19,12 +19,19 @@ import numpy as np
 
 import holo_models as MODELS
 from holo3d import (HOLO_BLUE, HOLO_CYAN, HOLO_DEEP, HOLO_DIM, HOLO_WHITE,
-                    FLIP_X, clamp01, dim, ease_out_back, project, render_glow,
+                    FLIP_X, MONO_DIM, MONO_FILL, MONO_GREY, MONO_WHITE,
+                    clamp01, dim, ease_out_back, project, render_glow,
                     render_mesh, rot_matrix, smoothstep)
 
 
 def hand_frame(feat, w: int, h: int):
-    """Screen-space frame of one hand: wrist, aim axis, thumb side, size."""
+    """Screen-space frame of one hand: wrist, aim axis, thumb side, size.
+
+    'dz' is how far the knuckles sit IN FRONT of the wrist, in hand-lengths,
+    read off the landmarks' depth channel: positive when the hand is pointing
+    at the camera.  Mounted hardware uses it to tilt in depth, so it turns with
+    the arm in 3D instead of sliding around on a flat plane.
+    """
     if feat is None:
         return None
     wr = feat["wrist"] * np.array([w, h])
@@ -37,14 +44,28 @@ def hand_frame(feat, w: int, h: int):
     side = (-ax[1], ax[0])
     if side[0] * (th[0] - wr[0]) + side[1] * (th[1] - wr[1]) < 0.0:
         side = (-side[0], -side[1])
-    return {"W": wr, "M": mc, "L": length, "ax": ax, "side": side,
+    dz = 0.0
+    lms = feat.get("landmarks")
+    if lms is not None:
+        try:                                  # 0 = wrist, 9 = middle-finger MCP
+            span = math.hypot(lms[9].x - lms[0].x, lms[9].y - lms[0].y)
+            dz = (lms[0].z - lms[9].z) / (span + 1e-6)
+        except Exception:  # noqa: BLE001 - depth is a bonus, never a requirement
+            dz = 0.0
+        dz = max(-1.1, min(1.1, dz))
+    return {"W": wr, "M": mc, "L": length, "ax": ax, "side": side, "dz": dz,
             "theta": math.atan2(ax[1], ax[0])}
 
 
 def _mount_rot(fr, wobble: float = 0.0):
-    """Rotation putting the model's +x along the arm and +y on the thumb side."""
+    """Rotation putting the model's +x along the arm and +y on the thumb side.
+
+    The yaw also carries the hand's depth tilt: point your hand at the camera
+    and the barrel foreshortens toward you, exactly as a real one bolted to
+    that wrist would.
+    """
     th = fr["theta"]
-    rot = rot_matrix(0.55 + wobble, -0.34, th)
+    rot = rot_matrix(0.55 + wobble - 0.85 * fr.get("dz", 0.0), -0.34, th)
     # does model +y currently point toward the thumb?  if not, mirror it
     up = (math.sin(th), math.cos(th))
     if up[0] * fr["side"][0] + up[1] * fr["side"][1] < 0.0:
@@ -68,8 +89,8 @@ class WebShooter:
             arrive    flying from the summoning pinch to this wrist
             seek      the wrist is not visible: parked, waiting to snap on
             on        mounted on the wrist, tracking the hand
-            held      grabbed (4 s lock) and following a pinch
-            float     parked in mid-air where it was let go
+            held      grabbed (4 s lock) or just pulled off, following a pinch
+            float     detached: its own object, parked where it was let go
             dismiss   spinning down and dissolving
     """
 
@@ -115,6 +136,27 @@ class WebShooter:
             return "dismissed"
         self.summon(t, from_px, park_px)
         return "summoned"
+
+    def detach(self, t: float, px) -> bool:
+        """Peel the shooter off the wrist - the real 'take it off' gesture.
+
+        Reaching over, pinching the shooter on the other wrist and pulling is
+        exactly how you take one off in real life, so it comes straight off:
+        no 4-second move lock, no dismissal.  It becomes its own free object,
+        follows the pinch, and stays wherever it is let go.
+        """
+        if self.state not in ("on", "seek"):
+            return False
+        self.state = "held"
+        self._lock = t
+        self._flash = t
+        self.scale = max(self.scale, 40.0)
+        if self.pos is not None:
+            self._drag_off = (self.pos[0] - px[0], self.pos[1] - px[1])
+        else:
+            self.pos = (float(px[0]), float(px[1]))
+            self._drag_off = (0.0, 0.0)
+        return True
 
     # -- drag protocol ------------------------------------------------------ #
     def drag_point(self):
@@ -285,13 +327,23 @@ _SPECS = ("SHEAR      120 MPa", "FLUID      2 x 40 ml", "PRESSURE   310 bar",
 
 
 class Blueprint:
-    """A rotating, exploding, dimensioned 3D breakdown of the web-shooter.
+    """An exploding, dimensioned 3D breakdown of the web-shooter.
+
+    Drawn in BLACK AND WHITE - it is a drafting hologram, not part of the blue
+    hard-light kit, and the monochrome keeps its callouts readable over the
+    blue everything else.
+
+    It does NOT rotate: a spinning schematic is impossible to read.  It holds a
+    fixed three-quarter view (with a couple of degrees of parallax sway, which
+    is what sells the depth) and does all its motion in the explode cycle.
 
     Spawned by a single fist; stays until the fist gesture dismisses it, so it
     can be grabbed (4 s lock) and moved anywhere on screen.
     """
 
     CYCLE = 6.0
+    YAW = 0.62               # fixed three-quarter presentation angle
+    PITCH = -0.28
 
     def __init__(self, px, radius: float, t: float):
         self.pos = (float(px[0]), float(px[1]))
@@ -361,26 +413,34 @@ class Blueprint:
         spread = self._phase()
         c = (self.pos[0] * k, self.pos[1] * k)
         s = self.scale * k * (0.55 + 0.45 * smoothstep(clamp01(self.t / 0.35)))
-        rot = rot_matrix(0.55 + self.t * 0.34, -0.30 + 0.08 * math.sin(self.t * 0.5),
-                         0.06 * math.sin(self.t * 0.7))
+        # fixed view; the tiny sway is parallax, not rotation
+        rot = rot_matrix(self.YAW + 0.045 * math.sin(self.t * 0.55),
+                         self.PITCH + 0.03 * math.sin(self.t * 0.37), 0.0)
         self._rot, self._c, self._s = rot, c, s
         hot = 1.0 * (1.0 - clamp01((self.t - self._lock) / 0.5)) \
             if self.t - self._lock < 0.5 else 0.0
+        # a ghosted un-exploded shell behind the parts: you can see where every
+        # piece came from, which is the whole point of an exploded view
+        if spread > 0.05:
+            render_mesh(ov, MODELS.shooter_mesh(), c, s, rot, alpha=alpha * 0.22,
+                        fill=MONO_DIM, edge=MONO_GREY, wire=1.0, scan=False,
+                        cull=True)
         render_mesh(ov, MODELS.shooter_mesh(), c, s, rot,
                     explode=0.95 * spread, alpha=alpha,
+                    fill=MONO_FILL, edge=MONO_WHITE,
                     wire=0.30 * spread, hot=hot, cull=True)
-        # containment ring + orbiting motes
+        # containment ring + orbiting motes (mono: this is a drafting hologram)
         pr = s * 2.0 * (0.96 + 0.04 * math.sin(self.t * 2.4))
-        _ring(ov, c, pr, dim(HOLO_CYAN, alpha * (0.3 + 0.2 * math.sin(self.t * 2.0))), 1)
+        _ring(ov, c, pr, dim(MONO_GREY, alpha * (0.3 + 0.2 * math.sin(self.t * 2.0))), 1)
         for i in range(9):
             a = self.t * 0.8 + i * 2.0 * math.pi / 9.0
             cv2.circle(ov, (int(c[0] + math.cos(a) * pr),
                             int(c[1] + math.sin(a) * pr * 0.42)), 2,
-                       dim(HOLO_CYAN, alpha * (0.35 + 0.5 *
+                       dim(MONO_GREY, alpha * (0.35 + 0.5 *
                                                (0.5 + 0.5 * math.sin(self.t * 5 + i)))), -1)
         if self.t - self.born < 0.5:              # converging focus ring
             f = (self.t - self.born) / 0.5
-            _ring(ov, c, s * (3.2 - 2.0 * f), dim(HOLO_CYAN, 0.8 * (1.0 - f)), 2)
+            _ring(ov, c, s * (3.2 - 2.0 * f), dim(MONO_WHITE, 0.8 * (1.0 - f)), 2)
 
     def annotate(self, frame, t: float) -> None:
         """Crisp full-resolution callouts, dimension lines and the spec block."""
@@ -392,7 +452,7 @@ class Blueprint:
         c, s, rot = self.pos, self.scale, self._rot
         spread = self._phase()
         mesh = MODELS.shooter_mesh()
-        col = dim(HOLO_CYAN, 0.9 * alpha)
+        col = dim(MONO_GREY, 0.9 * alpha)
         # frame + title block
         x0, y0 = int(c[0] - s * 2.3), int(c[1] - s * 2.0)
         x1, y1 = int(c[0] + s * 2.3), int(c[1] + s * 2.0)
@@ -400,18 +460,18 @@ class Blueprint:
                                  (x0, y1, 1, -1), (x1, y1, -1, -1)):
             cv2.line(hud, (ax, ay), (ax + bx * 26, ay), col, 1, cv2.LINE_AA)
             cv2.line(hud, (ax, ay), (ax, ay + by * 26), col, 1, cv2.LINE_AA)
-        cv2.line(hud, (x0, y0 - 14), (x0 + 190, y0 - 14), dim(HOLO_BLUE, 0.8 * alpha), 1)
+        cv2.line(hud, (x0, y0 - 14), (x0 + 190, y0 - 14), dim(MONO_GREY, 0.8 * alpha), 1)
         _text(hud, "WEB-SHOOTER MK-V  //  EXPLODED", (x0, y0 - 20), 0.42,
-              dim(HOLO_CYAN, alpha))
+              dim(MONO_WHITE, alpha))
         _text(hud, "ARACHNID OS  ::  SCHEMATIC 04-B", (x0, y1 + 22), 0.36,
-              dim(HOLO_BLUE, alpha))
+              dim(MONO_GREY, alpha))
         # spec block down the near side
         sx = x1 + 14 if x1 + 190 < w else x0 - 186
         for i, line in enumerate(_SPECS):
             bar = 0.35 + 0.5 * (0.5 + 0.5 * math.sin(t * 2.0 + i))
-            _text(hud, line, (sx, y0 + 26 + i * 19), 0.36, dim(HOLO_BLUE, 0.95 * alpha))
+            _text(hud, line, (sx, y0 + 26 + i * 19), 0.36, dim(MONO_GREY, 0.95 * alpha))
             cv2.line(hud, (sx, y0 + 30 + i * 19), (int(sx + 60 * bar), y0 + 30 + i * 19),
-                     dim(HOLO_CYAN, 0.7 * alpha), 1)
+                     dim(MONO_WHITE, 0.7 * alpha), 1)
         # part callouts: leader line from each exploded part to a label
         if spread > 0.15:
             for n, pid in enumerate(mesh.parts):
@@ -421,8 +481,8 @@ class Blueprint:
                 lx = p[0] + out * (s * 0.55 + 26.0)
                 ly = p[1] + (n - 3) * 6.0
                 strong = (n == self._focus)
-                lc = dim(HOLO_WHITE if strong else HOLO_CYAN,
-                         (0.95 if strong else 0.55) * alpha)
+                lc = dim(MONO_WHITE if strong else MONO_GREY,
+                         (0.95 if strong else 0.62) * alpha)
                 cv2.line(hud, (int(p[0]), int(p[1])), (int(lx), int(ly)), lc, 1, cv2.LINE_AA)
                 cv2.line(hud, (int(lx), int(ly)), (int(lx + out * 30), int(ly)), lc, 1,
                          cv2.LINE_AA)
@@ -435,7 +495,7 @@ class Blueprint:
             a3 = mesh.part_centre(MODELS.WS_BAND, 0.95 * spread)
             b3 = mesh.part_centre(MODELS.WS_NOZZLE, 0.95 * spread)
             pa, pb = project(np.stack([a3, b3]), c, s, rot)
-            _dimline(hud, pa, pb, dim(HOLO_BLUE, 0.85 * alpha))
+            _dimline(hud, pa, pb, dim(MONO_GREY, 0.85 * alpha))
 
 
 def _text(img, s: str, org, scale=0.4, colour=HOLO_CYAN, thick=1):

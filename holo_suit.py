@@ -99,7 +99,7 @@ class SuitGear:
             if fr is None:
                 continue
             arm = {"theta": math.atan2(-fr["ax"][1], -fr["ax"][0]),
-                   "side": fr["side"], "L": fr["L"]}
+                   "side": fr["side"], "L": fr["L"], "dz": -fr["dz"]}
             rot = _mount_rot(arm, wobble=0.04 * math.sin(self.t * 1.4))
             c = (fr["W"][0] - fr["ax"][0] * 0.12 * fr["L"],
                  fr["W"][1] - fr["ax"][1] * 0.12 * fr["L"])
@@ -119,7 +119,15 @@ class SuitGear:
         cx, cy, sc = anchor
         c = (cx * k, cy * k)
         s = sc * k
-        yaw = 0.10 * math.sin(self.t * 0.6) + clamp01((cx / (ov.shape[1] / k)) - 0.5) * 0.3
+        # The torso turns to face the camera as you move across the frame: real
+        # parallax, so the suit sits in the scene instead of being pasted on.
+        # (This used to be clamp01()-ed, which threw away the whole left half of
+        # the frame and left the suit facing dead ahead most of the time.)
+        off = (cx / max(1.0, ov.shape[1] / k)) - 0.5
+        # the constant bias keeps the chest slightly turned even dead-centre:
+        # square-on, a torso shell projects to a flat oval and stops reading as
+        # a volume at all
+        yaw = 0.22 + 0.08 * math.sin(self.t * 0.6) - off * 0.85
         rot = rot_matrix(yaw, -0.06 + 0.03 * math.sin(self.t * 0.8), 0.0)
         alpha = fade * (0.92 + 0.08 * math.sin(self.t * 17.0) * math.sin(self.t * 5.3))
         wire = (1.0 - smoothstep(build)) * 0.85
