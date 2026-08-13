@@ -570,9 +570,13 @@ class HoloDesk:
     """Owns the shooters, the blueprint, the suit and the 4-second move lock."""
 
     DRAG_ARM = 4.0            # seconds a grab must be held before it moves
+    MAX_SHOOTERS = 2          # one per wrist, and never more than that
 
     def __init__(self, log=print):
+        # exactly two shooters exist, ever - one per wrist.  They are re-used,
+        # never re-created, so no gesture can ever put a third on screen.
         self.shooters = {"Right": WebShooter("Right"), "Left": WebShooter("Left")}
+        self._auto = {"Right": False, "Left": False}
         self.blueprint = None
         self.suit = None
         self.drags: dict = {"Right": None, "Left": None}
@@ -633,6 +637,8 @@ class HoloDesk:
         # frame on its own side - never floating in the middle of the view.
         park = (0.11 * w if target == "Left" else 0.89 * w, 0.34 * h)
         sh = self.shooters[target]
+        if not sh.active() and self.live_shooters() >= self.MAX_SHOOTERS:
+            return                                  # two on screen is the limit
         what = sh.toggle(t, px, park)
         self._log(f"[gesture] pinch-pull {side} -> {target} wrist shooter {what}")
 
@@ -681,10 +687,34 @@ class HoloDesk:
         self.drags[side] = None
 
     # -- per-frame ----------------------------------------------------------- #
+    def live_shooters(self) -> int:
+        return sum(1 for s in self.shooters.values() if s.active())
+
+    def _autospawn(self, t, by_side, w, h):
+        """Kit up the moment a wrist comes into frame.
+
+        The shooter for a wrist arrives on its own the first time that hand is
+        seen - no gesture needed.  It happens once per wrist: if you then send
+        one away with pinch-pull, it stays away until you summon it back.
+        """
+        for side in ("Right", "Left"):
+            feat = by_side[side]
+            sh = self.shooters[side]
+            if feat is None or self._auto[side] or sh.active():
+                continue
+            if self.live_shooters() >= self.MAX_SHOOTERS:
+                continue
+            wr = feat["wrist"] * np.array([w, h])
+            sh.summon(t, (float(wr[0]), float(wr[1] + 0.22 * h)),
+                      (float(wr[0]), float(wr[1])))
+            self._auto[side] = True
+            self._log(f"[auto] {side} wrist in frame -> shooter equipped")
+
     def update(self, dt, t, feats, w, h):
         by_side = {"Right": None, "Left": None}
         for f in feats:
             by_side[self._side(f)] = f
+        self._autospawn(t, by_side, w, h)
         for side, d in list(self.drags.items()):
             feat = by_side[side]
             if d is None:
@@ -1344,6 +1374,21 @@ def selftest(args: argparse.Namespace) -> int:
     desk.update(1 / 30.0, 0.25, [], 640, 480)
     assert desk.shooters["Left"].state == "dismiss", "pulling again sends it away"
     print("[ok] desk: pinch-pull equips the OPPOSITE wrist, again to dismiss")
+
+    # 10a. a wrist coming into frame equips itself, and only ever two exist
+    desk_a = HoloDesk(log=lambda *a: None)
+    assert desk_a.live_shooters() == 0, "nothing is equipped before a hand is seen"
+    desk_a.update(1 / 30.0, 0.0, feats, 640, 480)
+    assert desk_a.live_shooters() == 2, "both wrists must equip on sight"
+    for i in range(30):
+        desk_a.update(1 / 30.0, i / 30.0, feats, 640, 480)
+    pf = _fake_feat(True, pinch3=0.10)
+    for extra in range(3):                     # keep pulling: still only two
+        desk_a.handle([("pull", pf)], 640, 480, 2.0 + extra)
+        desk_a.update(1 / 30.0, 2.0 + extra, feats, 640, 480)
+        assert desk_a.live_shooters() <= HoloDesk.MAX_SHOOTERS, \
+            "never more than two shooters on screen"
+    print("[ok] desk: wrists equip on sight, and only ever two shooters exist")
 
     # 10b. pinching a WORN shooter and pulling takes it off, then it stays put
     desk3 = HoloDesk(log=lambda *a: None)
