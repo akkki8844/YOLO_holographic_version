@@ -65,7 +65,7 @@ def _mount_rot(fr, wobble: float = 0.0):
     that wrist would.
     """
     th = fr["theta"]
-    rot = rot_matrix(0.55 + wobble - 0.85 * fr.get("dz", 0.0), -0.34, th)
+    rot = rot_matrix(0.42 + wobble - 0.85 * fr.get("dz", 0.0), -0.30, th)
     # does model +y currently point toward the thumb?  if not, mirror it
     up = (math.sin(th), math.cos(th))
     if up[0] * fr["side"][0] + up[1] * fr["side"][1] < 0.0:
@@ -163,7 +163,7 @@ class WebShooter:
         return self.pos if self.state in ("on", "float", "held") else None
 
     def drag_radius(self) -> float:
-        return max(46.0, self.scale * 1.7)
+        return max(46.0, self.scale * 1.05)
 
     def begin_drag(self, px, t: float) -> None:
         self.state = "held"
@@ -189,10 +189,11 @@ class WebShooter:
         self._fr = fr
         self.spin += dt
         if fr is not None:
-            # band just behind the wrist, spinneret just past the knuckles
-            anchor = (fr["W"][0] + fr["ax"][0] * 0.26 * fr["L"],
-                      fr["W"][1] + fr["ax"][1] * 0.26 * fr["L"])
-            live_scale = 0.56 * fr["L"]
+            # the model origin is the wrist itself: the bracer runs back up the
+            # forearm from here and only the spinneret crosses onto the hand
+            anchor = (fr["W"][0] + fr["ax"][0] * 0.04 * fr["L"],
+                      fr["W"][1] + fr["ax"][1] * 0.04 * fr["L"])
+            live_scale = 1.05 * fr["L"]
         else:
             anchor, live_scale = None, None
 
@@ -279,30 +280,32 @@ class WebShooter:
         if self.pos is None or self.state == "off" or self.scale < 4.0:
             return
         alpha, wire, hot = self._shading(t)
+        # gain under 1: worn on the arm it has to stay hard-light, so your own
+        # forearm still reads through the shell
         render_glow(frame, MODELS.shooter_mesh(1), self.pos, self.scale, self.rot,
                     alpha=alpha, wire=wire, hot=hot, cull=True,
-                    gain=0.92, glow=0.5)
+                    gain=0.78, glow=0.42)
 
     def _fx(self, ov, k: float, t: float, c, s: float) -> None:
         if t - self._flash < 0.55:               # materialise ripple
             f = (t - self._flash) / 0.55
-            _ring(ov, c, s * (0.8 + 2.0 * f), dim(HOLO_CYAN, 0.85 * (1.0 - f)), 2)
+            _ring(ov, c, s * (0.5 + 1.3 * f), dim(HOLO_CYAN, 0.85 * (1.0 - f)), 2)
         if self.state in ("held", "float", "seek"):
-            _ring(ov, c, s * 1.55, dim(HOLO_CYAN, 0.35 + 0.25 * math.sin(t * 5.0)), 1)
+            _ring(ov, c, s * 1.05, dim(HOLO_CYAN, 0.35 + 0.25 * math.sin(t * 5.0)), 1)
             for i in range(6):                   # orbiting motes
                 a = t * 1.1 + i * math.pi / 3.0
-                mx = c[0] + math.cos(a) * s * 1.55
-                my = c[1] + math.sin(a) * s * 0.65
+                mx = c[0] + math.cos(a) * s * 1.05
+                my = c[1] + math.sin(a) * s * 0.45
                 cv2.circle(ov, (int(mx), int(my)), 2,
                            dim(HOLO_CYAN, 0.4 + 0.5 * math.sin(t * 4.0 + i)), -1)
         if self.state == "on" and self._fr is not None:
             # strap glow around the wrist band, so it reads as WORN rather
             # than as an object floating near the arm
-            band = project(np.array([[-0.58, 0.0, 0.0]]), c, s, self.rot)[0]
-            _ring(ov, band, s * 0.92, dim(HOLO_BLUE, 0.45), 1,
+            band = project(np.array([[-0.06, 0.0, 0.0]]), c, s, self.rot)[0]
+            _ring(ov, band, s * 0.58, dim(HOLO_BLUE, 0.45), 1,
                   squash=0.80, ang=self._fr["theta"] + math.pi / 2.0)
             # muzzle bloom at the spinneret
-            nozzle = project(np.array([[1.36, 0.99, 0.0]]), c, s, self.rot)[0]
+            nozzle = project(np.array([[0.57, 0.55, 0.0]]), c, s, self.rot)[0]
             pulse = 0.45 + 0.30 * (0.5 + 0.5 * math.sin(t * 3.4))
             cv2.circle(ov, (int(nozzle[0]), int(nozzle[1])), max(2, int(0.13 * s)),
                        dim(HOLO_CYAN, pulse * 0.7), 1, cv2.LINE_AA)

@@ -114,8 +114,8 @@ class Hud:
             x += wlab + 12
         text(ov, "PINCH+PULL = SHOOTER ON OTHER WRIST   |   PINCH A WORN SHOOTER"
                  " + PULL = TAKE IT OFF", (28, h - 38), 0.34, dim(HOLO_BLUE, 0.85))
-        text(ov, "FIST = BLUEPRINT   |   BOTH FISTS 1s = SUIT   |   "
-                 "HOLD GRAB 4s = MOVE", (28, h - 20), 0.34, dim(HOLO_BLUE, 0.85))
+        text(ov, "FIST = BLUEPRINT   |   HOLD GRAB 4s = MOVE",
+             (28, h - 20), 0.34, dim(HOLO_BLUE, 0.85))
 
     def _hands(self, ov, w, h, t, ctx):
         for hnd in ctx.get("hands", []):
@@ -139,13 +139,6 @@ class Hud:
             if hnd.get("pinch"):
                 cv2.circle(ov, (int(px), int(py)), 5, dim(HOLO_WHITE, 0.95), -1,
                            cv2.LINE_AA)
-        gear_p = float(ctx.get("gear_p", 0.0))
-        if gear_p > 0.02:
-            cx, cy = w // 2, int(h * 0.16)
-            arc(ov, (cx, cy), 34, -90, -90 + 360 * clamp01(gear_p),
-                dim(HOLO_WHITE, 0.95), 3)
-            cv2.circle(ov, (cx, cy), 34, dim(HOLO_BLUE, 0.6), 1, cv2.LINE_AA)
-            text(ov, "SUIT", (cx - 19, cy + 5), 0.4, dim(HOLO_CYAN, 0.95))
 
     def _drags(self, ov, t, ctx):
         for d in ctx.get("drags", []):

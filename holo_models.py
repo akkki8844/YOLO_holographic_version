@@ -37,67 +37,83 @@ def _cached(name: str, builder):
 # The Mk-V web-shooter
 # --------------------------------------------------------------------------- #
 def _build_shooter(detail: int = 1) -> Mesh:
-    """detail 1 = the blueprint hero model, 0 = the small wrist-worn LOD."""
+    """The Mk-V bracer: a forearm shell running from mid-forearm to the wrist.
+
+    Origin sits AT THE WRIST, so the whole rig extends back up the arm along
+    -x and only the barrel and spinneret cross forward past the wrist crease -
+    the way the real thing is worn.  The cross-section is wider across the arm
+    (z) than it is deep (y), because a forearm is.
+
+    detail 1 = the blueprint hero model, 0 = the worn LOD.
+    """
     m = Mesh()
-    seg = 10 if detail else 7
-    maj = 14 if detail else 9
+    seg = 12 if detail else 9
+    maj = 14 if detail else 10
     mino = 5 if detail else 4
-    ribs = 3 if detail else 1
+    ribs = 3 if detail else 2
+    SQ = 1.35                            # forearm is wider than it is deep
 
-    # 1. wrist band: main ring, an inner liner and two locking clamps
-    m.part(WS_BAND, (-1.15, 0.0, 0.0))
-    m.torus((-0.58, 0.0, 0.0), (1, 0, 0), 0.78, 0.135, maj, mino, 1.0, squash=0.82)
+    # 1. wrist collar: where the bracer clamps shut, right on the wrist bone
+    m.part(WS_BAND, (0.35, 0.0, 0.0))
+    m.torus((-0.06, 0.0, 0.0), (1, 0, 0), 0.50, 0.085, maj, mino, 1.0, squash=SQ)
     if detail:
-        m.torus((-0.30, 0.0, 0.0), (1, 0, 0), 0.70, 0.055, maj, 4, 0.75, squash=0.82)
-    for sz in (-1, 1):
-        m.box((-0.58, 0.30, sz * 0.62), (0.20, 0.10, 0.07), 0.9)
+        m.torus((-0.26, 0.0, 0.0), (1, 0, 0), 0.46, 0.04, maj, 4, 0.75, squash=SQ)
+    for sz in (-1, 1):                   # locking clamps on the sides
+        m.box((-0.10, 0.10, sz * 0.66), (0.15, 0.07, 0.055), 0.9)
 
-    # 2. main housing: chassis, top deck, vents and the sensor lens
-    m.part(WS_HOUSING, (0.0, 1.25, 0.10))
-    m.box((0.00, 0.92, 0.0), (0.60, 0.20, 0.40), 1.0)
-    m.box((-0.10, 1.14, 0.0), (0.42, 0.06, 0.30), 0.95)
-    for i in range(3):
-        m.box((-0.28 + i * 0.20, 1.21, 0.0), (0.055, 0.03, 0.22), 0.7)
-    m.disc((0.34, 1.16, 0.0), (0, 1, 0), 0.13, 10, 1.0)
-    m.torus((0.34, 1.17, 0.0), (0, 1, 0), 0.155, 0.03, 10, 4, 0.9)
-    for sz in (-1, 1):                       # chassis rails down to the band
-        m.box((-0.05, 0.66, sz * 0.34), (0.52, 0.09, 0.05), 0.8)
+    # 2. the bracer shell: a slim tapered sleeve, flattened onto the forearm so
+    #    the hardware bolted to it stays proud of the silhouette
+    m.part(WS_HOUSING, (0.0, 1.30, 0.10))
+    m.tube((-2.80, 0.0, 0.0), (-0.10, 0.0, 0.0), 0.34, 0.48, seg, 0.95,
+           squash=SQ, cap0=False, cap1=False)
+    for i, x in enumerate((-2.45, -1.80, -1.15, -0.50)):  # armour bands
+        m.torus((x, 0.0, 0.0), (1, 0, 0), 0.36 + 0.032 * i, 0.05, maj, 4, 0.9,
+                squash=SQ)
+    # raised dorsal deck along the back of the forearm
+    m.box((-1.30, 0.50, 0.0), (1.05, 0.10, 0.26), 1.0)
+    m.box((-1.30, 0.62, 0.0), (0.80, 0.045, 0.18), 0.95)
+    for i in range(4):                                   # heat vents
+        m.box((-1.95 + i * 0.42, 0.67, 0.0), (0.055, 0.028, 0.13), 0.7)
+    m.disc((-0.40, 0.62, 0.0), (0, 1, 0), 0.10, 10, 1.0)  # status lens
+    m.torus((-0.40, 0.63, 0.0), (0, 1, 0), 0.125, 0.024, 10, 4, 0.9)
 
-    # 3. twin web-fluid cartridges slung under the housing
-    m.part(WS_CART, (0.0, -1.30, 0.35))
+    # 3. twin web-fluid cartridges, slung either side of the deck
+    m.part(WS_CART, (0.0, -1.30, 0.40))
     for sz in (-1, 1):
-        m.tube((-0.36, 0.60, sz * 0.24), (0.42, 0.60, sz * 0.24), 0.115, 0.115,
+        m.tube((-2.20, 0.26, sz * 0.44), (-0.40, 0.26, sz * 0.44), 0.105, 0.105,
                seg, 0.95)
         if detail:
-            m.torus((0.20, 0.60, sz * 0.24), (1, 0, 0), 0.135, 0.028, 9, 4, 0.8)
-            m.torus((-0.14, 0.60, sz * 0.24), (1, 0, 0), 0.135, 0.028, 9, 4, 0.8)
+            m.torus((-0.52, 0.26, sz * 0.44), (1, 0, 0), 0.125, 0.026, 9, 4, 0.8)
+            m.torus((-2.08, 0.26, sz * 0.44), (1, 0, 0), 0.125, 0.026, 9, 4, 0.8)
 
-    # 4. barrel: tapered tube with cooling ribs
+    # 4. barrel: crosses the wrist toward the hand, with cooling ribs
     m.part(WS_BARREL, (0.60, 0.55, 0.45))
-    m.tube((0.52, 0.94, 0.0), (1.14, 0.98, 0.0), 0.135, 0.098, seg, 1.0)
+    m.tube((-0.22, 0.40, 0.0), (0.34, 0.44, 0.0), 0.115, 0.085, seg, 1.0)
     for i in range(ribs):
-        m.torus((0.66 + i * 0.20, 0.95 + i * 0.013, 0.0), (1, 0.06, 0), 0.150, 0.026,
-                9, 4, 0.85)
+        m.torus((-0.10 + i * 0.17, 0.41 + i * 0.012, 0.0), (1, 0.06, 0), 0.128,
+                0.024, 9, 4, 0.85)
 
-    # 5. nozzle + spinneret tip
-    m.part(WS_NOZZLE, (1.55, 0.15, 0.0))
-    m.tube((1.14, 0.98, 0.0), (1.34, 0.99, 0.0), 0.098, 0.062, seg, 1.0)
+    # 5. spinneret: sits just past the wrist crease, aimed down the fingers
+    m.part(WS_NOZZLE, (1.35, 0.15, 0.0))
+    m.tube((0.34, 0.44, 0.0), (0.58, 0.45, 0.0), 0.085, 0.052, seg, 1.0)
     if detail:
-        m.torus((1.30, 0.99, 0.0), (1, 0, 0), 0.085, 0.025, 9, 4, 1.0)
-    m.disc((1.35, 0.99, 0.0), (1, 0, 0), 0.05, 8, 1.0)
+        m.torus((0.54, 0.45, 0.0), (1, 0, 0), 0.072, 0.022, 9, 4, 1.0)
+    m.disc((0.59, 0.45, 0.0), (1, 0, 0), 0.045, 8, 1.0)
 
-    # 6. trigger pad on the palm side
-    m.part(WS_TRIGGER, (0.0, 1.10, -1.20))
-    m.box((0.18, 0.74, -0.44), (0.20, 0.10, 0.09), 1.0)
-    m.box((0.18, 0.66, -0.50), (0.13, 0.05, 0.05), 0.8)
+    # 6. trigger pad, on the palm side under the wrist
+    m.part(WS_TRIGGER, (0.0, -1.20, -0.60))
+    m.box((-0.02, -0.40, 0.0), (0.20, 0.075, 0.13), 1.0)
+    m.box((0.14, -0.47, 0.0), (0.09, 0.045, 0.06), 0.8)
 
-    # 7. side pods: stabiliser plates + status nodes
-    m.part(WS_POD, (-0.35, 0.10, -1.35))
+    # 7. side pods: stabiliser plates along the flanks + status nodes
+    m.part(WS_POD, (-0.35, 0.10, -1.45))
     for sz in (-1, 1):
-        m.box((-0.02, 0.86, sz * 0.50), (0.34, 0.14, 0.05), 0.85)
+        m.box((-1.45, 0.10, sz * 0.58), (0.80, 0.12, 0.045), 0.85)
         if detail:
-            m.ellipsoid((0.24, 0.86, sz * 0.52), (0.075, 0.075, 0.045), 7, 3, 1.0)
-    return m.compile()
+            m.ellipsoid((-0.68, 0.14, sz * 0.60), (0.07, 0.07, 0.04), 7, 3, 1.0)
+    # a bracer is long and slim: authored full-width, then narrowed across so
+    # it hugs the forearm instead of swallowing it
+    return m.slim(0.68).compile()
 
 
 def shooter_mesh(detail: int = 1) -> Mesh:

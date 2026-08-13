@@ -27,11 +27,6 @@ Gestures
                                                dimensions.  It holds still so
                                                it can be read.  Same gesture
                                                again dismisses it.
-  BOTH FISTS, hold 1.0 s ...................... the full holographic suit -
-                                               torso, spider emblem, webbing,
-                                               shoulders, belt and an armoured
-                                               gauntlet on each wrist.  Never a
-                                               mask.  Hold again to take it off.
   GRAB an object and HOLD 4 s ................. a lock ring charges around it;
                                                when it snaps READY the object
                                                follows your hand.  Let go and it
@@ -87,7 +82,6 @@ from holo3d import (HOLO_BLUE, HOLO_CYAN, HOLO_DEEP, HOLO_DIM, HOLO_WHITE,
                     clamp01, dim as _dim)
 from holo_hud import Hud
 from holo_objects import Blueprint, WebShooter, hand_frame
-from holo_suit import SuitGear
 
 try:
     import mediapipe as mp  # heavy import; handled later with clear errors
@@ -276,47 +270,35 @@ def hand_features(landmarks, is_right: bool) -> dict:
     }
 
 
-MIRROR_HANDEDNESS = True    # see classify_hands()
-
-
 def classify_hands(result) -> list:
     """Turn a detection result into a list of per-hand feature dicts.
 
-    Every hand gets an 'is_right' flag.
+    Every hand gets an 'is_right' flag, decided PURELY BY SCREEN POSITION.
 
-    MediaPipe's own handedness label is reported for the image as given to it,
-    and this pipeline hands it a horizontally FLIPPED frame (the mirrored
-    selfie view, which is the only view that feels natural to gesture into).
-    In that frame the user's right hand is on the right of the picture, which
-    the model reads as a left hand - so its labels arrive inverted and are
-    swapped back here.  Getting this wrong is very visible: the shooter lands
-    on the wrist that summoned it instead of the opposite one.
+    The frame is mirrored before anything touches it, so the picture is a
+    mirror: whatever is on the right of the screen is your right hand, always.
+    That is also exactly how you check it - you look at which of your hands the
+    'R' is sitting on.  With two hands the rightmost is the right one; with one
+    hand, which side of centre it is on.
 
-    Without handedness, the position fallback applies (in the mirrored frame
-    the rightmost hand is the user's right hand).
+    MediaPipe's own handedness label is deliberately NOT used.  Its convention
+    depends on whether the frame it was given is mirrored, it disagrees between
+    the legacy and Tasks APIs, and when it is wrong the labels are wrong in a
+    way that no amount of guessing at the convention fixes.  Position cannot be
+    wrong in a mirrored frame.
     """
     hands = list(result.hand_landmarks or []) if result is not None else []
     if not hands:
         return []
-    try:
-        hd = list(result.handedness or [])
-    except Exception:  # noqa: BLE001 - varies across mediapipe versions
-        hd = []
-    labels = []
-    for i in range(len(hands)):
-        name = ""
-        if i < len(hd) and hd[i]:
-            cat = hd[i][0]
-            name = str(getattr(cat, "category_name", "") or "")
-            if MIRROR_HANDEDNESS and name:      # un-mirror: see the docstring
-                name = "Left" if name.lower().startswith("r") else "Right"
-        labels.append(name)
-    if not any(labels):
-        order = sorted(range(len(hands)), key=lambda i: -hands[i][0].x)
-        labels[order[0]] = "Right"
-        if len(order) > 1:
-            labels[order[-1]] = "Left"   # never overwrite a lone hand
-    return [hand_features(h, labels[i] == "Right") for i, h in enumerate(hands)]
+    xs = [float(np.mean([h[WRIST].x, h[MIDDLE_MCP].x])) for h in hands]
+    if len(hands) >= 2:
+        rightmost = max(range(len(hands)), key=lambda i: xs[i])
+        flags = [i == rightmost for i in range(len(hands))]
+        if len(hands) > 2:               # never expected, but stay sane
+            flags = [x > 0.5 for x in xs]
+    else:
+        flags = [xs[0] > 0.5]
+    return [hand_features(h, flags[i]) for i, h in enumerate(hands)]
 
 
 def draw_hand_holo(overlay, hand, k: float = 1.0, t: float = 0.0) -> None:
@@ -369,17 +351,15 @@ class GestureTracker:
       ('pull', feat)     a pinching hand travelled ~one hand-length while
                          still pinched -> the summon gesture
       ('unpinch', feat)  the pinch opened again
-      ('fist', feat)     ONE hand held a fist for FIST_HOLD (the other hand
-                         must not also be a fist) -> blueprint
-      ('gear', None)     BOTH fists held for GEAR_HOLD (1 s) -> the suit
+      ('fist', feat)     ONE hand held a fist for FIST_HOLD, with no other
+                         hand pinching -> blueprint
 
     Per-hand features are EMA-smoothed (matched by palm proximity), and hands
     that drop out for a few frames keep their state ("ghosting") so a tracking
     hiccup never cancels a gesture mid-way.
     """
 
-    FIST_HOLD = 0.40        # seconds one fist must be held
-    GEAR_HOLD = 1.00        # seconds BOTH fists must be held
+    FIST_HOLD = 0.55        # seconds one fist must be held
     GRAB_ON = 0.30          # pinch3 below this -> pinch begins
     GRAB_OFF = 0.46         # pinch3 above this -> pinch ends
     PINCH_OPEN = 0.50       # index must be at least this straight to pinch
@@ -387,13 +367,11 @@ class GestureTracker:
     GHOST_TTL = 0.35        # seconds a dropped hand keeps its state
     PULL_DIST = 0.75        # pull distance, in hand-lengths
     PULL_WINDOW = 2.5       # seconds a pinch stays eligible to become a pull
-    BOTH_GRACE = 0.30       # seconds a both-fist hold survives a tracking blip
+    PINCH_QUIET = 0.60      # seconds after a pinch that no fist may fire
 
     def __init__(self):
         self._slots: list = []
-        self._both_fist_since: float | None = None
-        self._both_fist_last = -9.0
-        self._gear_fired = False
+        self._pinch_last = -9.0
 
     # -- public ------------------------------------------------------------- #
     def feed(self, hands: list, t: float) -> list:
@@ -415,30 +393,18 @@ class GestureTracker:
 
         live = [s for s in self._slots if t - s["last_seen"] <= self.GHOST_TTL]
         fists = [s for s in live if s["fist"]]
-        # -- both fists -> the suit (fires while still held, no opening needed).
-        # A blip that loses a hand for a frame or two must not restart the
-        # count, so the hold survives BOTH_GRACE seconds of missing fists.
-        if len(fists) >= 2:
-            if self._both_fist_since is None or t - self._both_fist_last > self.BOTH_GRACE:
-                self._both_fist_since = t
-                self._gear_fired = False
-            self._both_fist_last = t
-            if not self._gear_fired and t - self._both_fist_since >= self.GEAR_HOLD:
-                self._gear_fired = True
-                events.append(("gear", None))
-                for s in self._slots:        # consume the whole fist cycle
-                    s["fist_fired"] = True
-        elif t - self._both_fist_last > self.BOTH_GRACE:
-            self._both_fist_since = None
-            self._gear_fired = False
 
         for s in self._slots:
             if s["matched"]:
                 self._pinch_edges(s, t, events)
+        if any(s["pinch"] for s in live):
+            self._pinch_last = t
         # -- one fist -> the blueprint --------------------------------------- #
-        # ...but never while a both-fist hold is still inside its grace window,
-        # or losing one hand for a frame would spawn a stray blueprint.
-        if len(fists) == 1 and t - self._both_fist_last > self.BOTH_GRACE:
+        # Never while ANY hand is pinching, or just has been: taking a shooter
+        # off means reaching across with one hand while the other holds still,
+        # and a hand held still is usually half-closed.  Without this, trying
+        # to detach a shooter spawned a blueprint instead.
+        if len(fists) == 1 and t - self._pinch_last > self.PINCH_QUIET:
             s = fists[0]
             if s["fist_since"] is not None and not s["fist_fired"] \
                     and t - s["fist_since"] >= self.FIST_HOLD:
@@ -473,10 +439,7 @@ class GestureTracker:
                 "curls": [float(c.get(k, 0.0)) for k in
                           ("index", "middle", "ring", "pinky", "thumb")],
             })
-        gear_p = 0.0
-        if self._both_fist_since is not None and not self._gear_fired:
-            gear_p = clamp01((t - self._both_fist_since) / self.GEAR_HOLD)
-        return {"hands": hands, "gear_p": gear_p}
+        return {"hands": hands}
 
     # -- internals ----------------------------------------------------------- #
     def _match(self, h):
@@ -578,7 +541,6 @@ class HoloDesk:
         self.shooters = {"Right": WebShooter("Right"), "Left": WebShooter("Left")}
         self._auto = {"Right": False, "Left": False}
         self.blueprint = None
-        self.suit = None
         self.drags: dict = {"Right": None, "Left": None}
         self.hud = Hud()
         self.debug = False
@@ -656,14 +618,6 @@ class HoloDesk:
         self.blueprint = Blueprint(dock, min(0.15 * h, max(0.085 * h, 1.2 * length)), 0.0)
         self._log("[gesture] fist -> web-shooter blueprint")
 
-    def on_gear(self, t):
-        if self.suit is not None and self.suit.dying is None:
-            self.suit.dismiss()
-            self._log("[gesture] both fists -> suit OFF")
-        else:
-            self.suit = SuitGear(t)
-            self._log("[gesture] both fists -> SUIT ON")
-
     def handle(self, events, w, h, t):
         for evt, payload in events:
             if evt == "pinch":
@@ -674,8 +628,6 @@ class HoloDesk:
                 self.on_unpinch(payload, w, h, t)
             elif evt == "fist":
                 self.on_fist(payload, w, h, t)
-            elif evt == "gear":
-                self.on_gear(t)
 
     def _end_drag(self, side, t):
         d = self.drags.get(side)
@@ -739,10 +691,6 @@ class HoloDesk:
             self.blueprint.update(dt)
             if not self.blueprint.alive():
                 self.blueprint = None
-        if self.suit is not None:
-            self.suit.update(dt)
-            if not self.suit.alive():
-                self.suit = None
 
     def drag_hud(self, t):
         out = []
@@ -763,7 +711,6 @@ class HoloDesk:
         armed = any(d is not None and d["armed"] for d in self.drags.values())
         return [("L WRIST", self.shooters["Left"].active(), 0.0),
                 ("R WRIST", self.shooters["Right"].active(), 0.0),
-                ("SUIT", self.suit is not None and self.suit.dying is None, 0.0),
                 ("BLUEPRINT", self.blueprint is not None, 0.0),
                 ("MOVE LOCK", armed, lock)]
 
@@ -772,8 +719,6 @@ class HoloDesk:
         h, w = frame.shape[:2]
         k = 0.5
         ov = np.zeros((max(2, int(h * k)), max(2, int(w * k)), 3), np.uint8)
-        if self.suit is not None:
-            self.suit.draw(ov, k, t, feats)
         for side in ("Right", "Left"):
             self.shooters[side].draw(ov, k, t)
         if self.blueprint is not None:
@@ -788,13 +733,11 @@ class HoloDesk:
         # pass of their own once the bloom is down
         for side in ("Right", "Left"):
             self.shooters[side].draw_sharp(frame, t)
-        if self.suit is not None:
-            self.suit.draw_sharp(frame, t, feats)
         if self.blueprint is not None:
             self.blueprint.annotate(frame, t)
         state = tracker.hud_state(t)
         self.hud.draw(frame, {"t": t, "fps": fps, "hand_count": len(feats),
-                              "hands": state["hands"], "gear_p": state["gear_p"],
+                              "hands": state["hands"],
                               "drags": self.drag_hud(t), "chips": self.chips(t),
                               "debug": self.debug,
                               "thresholds": {"grab_on": GestureTracker.GRAB_ON,
@@ -1217,8 +1160,7 @@ def selftest(args: argparse.Namespace) -> int:
     # 3. the 3D models compile and render real shaded geometry
     import holo3d as H3
     import holo_models as HM
-    for name, mesh in (("shooter", HM.shooter_mesh()), ("gauntlet", HM.gauntlet_mesh()),
-                       ("suit", HM.suit_mesh())):
+    for name, mesh in (("shooter", HM.shooter_mesh()), ("worn LOD", HM.shooter_mesh(0))):
         assert mesh.V is not None and len(mesh.FI) > 100, f"{name} mesh too coarse"
         canvas = np.zeros((240, 320, 3), np.uint8)
         H3.render_mesh(canvas, mesh, (160, 120), 60, H3.rot_matrix(0.6, -0.3, 0.2))
@@ -1298,16 +1240,16 @@ def selftest(args: argparse.Namespace) -> int:
     assert not bp.alive(), "a dismissed blueprint must expire"
     print("[ok] blueprint: black-and-white exploded view, holds still, callouts")
 
-    # 7. suit: draws torso + gauntlets from the visible hands, never a head
-    suit = SuitGear(0.0)
-    half = np.zeros((240, 320, 3), np.uint8)
-    for i in range(45):
-        suit.update(1 / 30.0)
-    suit.draw(half, 0.5, 1.5, feats)
-    assert half.any(), "the suit must draw with hands visible"
-    ys = np.nonzero(half.sum(axis=2) > 100)[0]
-    assert ys.size and ys.min() > 8, "the suit must never reach the top of frame"
-    print("[ok] suit: torso, emblem, webbing and gauntlets materialise")
+    # 7. the shooter is a forearm bracer: it must reach back up the arm, not
+    #    sit as a lump on the hand
+    mesh = HM.shooter_mesh()
+    xs = mesh.V[:, 0]
+    assert xs.min() < -1.5, "the bracer must run back up the forearm"
+    assert xs.max() < 0.8, "only the spinneret may cross forward of the wrist"
+    assert abs(xs.min()) > 2.0 * abs(xs.max()), \
+        "the bulk of the rig sits behind the wrist, on the forearm"
+    print(f"[ok] shooter is a forearm bracer (x {xs.min():.2f}..{xs.max():.2f}, "
+          f"origin at the wrist)")
 
     # 8. tracker: pinch + pull fires exactly one summon per pinch
     tr = GestureTracker()
@@ -1325,7 +1267,7 @@ def selftest(args: argparse.Namespace) -> int:
     assert not [e for e in evs if e[0] == "pull"], "a still pinch must not summon"
     print("[ok] tracker: pinch+pull summons once, a still pinch does not")
 
-    # 9. tracker: one fist -> blueprint, both fists 1 s -> suit (no blueprint)
+    # 9. tracker: one fist -> blueprint, but never while a hand is pinching
     assert is_fist(dict(thumb=0.95, index=0.3, middle=0.3, ring=0.35, pinky=0.4)), \
         "a real fist keeps the thumb straight across the fingers - it must count"
     assert not is_fist(dict(thumb=1.0, index=0.99, middle=0.99, ring=0.99, pinky=0.99)), \
@@ -1345,21 +1287,17 @@ def selftest(args: argparse.Namespace) -> int:
     for i in range(24):
         evs += tr3b.feed([_fake_feat(True, fist=True, dx=0.03 * i)], i / 30.0)
     assert not [e for e in evs if e[0] == "pull"], "a moving fist must not summon"
+    # reaching across to take a shooter off must NOT spawn a blueprint: one
+    # hand pinches while the other rests half-closed
     tr4 = GestureTracker()
     evs = []
     for i in range(40):
-        evs += tr4.feed([_fake_feat(True, fist=True),
-                         _fake_feat(False, fist=True, hand_id=0.35)], i / 30.0)
-    assert [e for e in evs if e[0] == "gear"], "both fists (1 s) must fire the suit"
+        evs += tr4.feed([_fake_feat(True, pinch3=0.10, dx=0.02 * i),
+                         _fake_feat(False, fist=True, hand_id=0.45)], i / 30.0)
+    assert [e for e in evs if e[0] == "pull"], "the reaching hand must still pull"
     assert not [e for e in evs if e[0] == "fist"], \
-        "both fists must never also spawn a blueprint"
-    early = []
-    for i in range(20):                        # 0.63 s: too short for the suit
-        early += tr4.feed([_fake_feat(True, fist=True, dy=0.2),
-                           _fake_feat(False, fist=True, hand_id=0.35, dy=0.2)],
-                          10.0 + i / 30.0)
-    assert not [e for e in early if e[0] == "gear"], "a short both-fist must not fire"
-    print("[ok] tracker: one fist -> blueprint, both fists 1 s -> suit")
+        "a fist must never fire the blueprint while the other hand is pinching"
+    print("[ok] tracker: one fist -> blueprint, never while a hand is pinching")
 
     # 10. desk: pinch-pull with the RIGHT hand arms the LEFT wrist, and vice versa
     desk = HoloDesk(log=lambda *a: None)

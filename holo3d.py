@@ -222,6 +222,15 @@ class Mesh:
             self.tri(mid, ring[k], ring[(k + 1) % seg], shade)
         return ring
 
+    def slim(self, k: float) -> "Mesh":
+        """Scale the whole model across its long axis (y and z), before compile.
+
+        Authoring a bracer is much easier if the cross-section can be tuned in
+        one place afterwards instead of in thirty radii.
+        """
+        self._v = [(x, y * k, z * k) for (x, y, z) in self._v]
+        return self
+
     # -- compile ------------------------------------------------------------ #
     def compile(self) -> "Mesh":
         self.V = np.asarray(self._v, np.float64)
@@ -234,8 +243,11 @@ class Mesh:
             dirs[pid] = d
         self.PDIR = dirs
         self.VD = dirs[self.VP]
-        c = self.V.mean(axis=0)
-        self.radius = float(np.abs(self.V - c).max()) or 1.0
+        # measured from the ORIGIN, not the centroid: the projection pivots on
+        # the origin, so that is what bounds the model on screen.  (A long
+        # model like the forearm bracer sits well off its own centroid, and a
+        # centroid-based radius under-sizes its scratch buffer and clips it.)
+        self.radius = float(np.abs(self.V).max()) or 1.0
         return self
 
     def part_centre(self, pid: int, explode: float = 0.0) -> np.ndarray:
@@ -358,6 +370,26 @@ def screen_radius(mesh: Mesh, scale: float) -> float:
     return scale * r * (DEPTH * FOCAL / max(DEPTH - r, 0.5))
 
 
+def mesh_bbox(mesh: Mesh, centre, scale: float, rot: np.ndarray,
+              explode: float = 0.0):
+    """Exact projected pixel bounds of a mesh - (x0, y0, x1, y1) floats.
+
+    One matmul over the vertices, which is far cheaper than the pixels saved:
+    a bounding SPHERE around a long thin model like the bracer is several
+    times its real footprint, and every one of those pixels would be blurred
+    and blended for nothing.
+    """
+    verts = mesh.V if explode <= 0.0 else mesh.V + mesh.VD * explode
+    vr = verts @ rot.T
+    zc = np.maximum(DEPTH - vr[:, 2], 0.35)
+    k = (DEPTH * FOCAL / zc) * scale
+    px = centre[0] + vr[:, 0] * k
+    py = centre[1] + vr[:, 1] * k
+    if not (np.isfinite(px).all() and np.isfinite(py).all()):
+        return None
+    return float(px.min()), float(py.min()), float(px.max()), float(py.max())
+
+
 def render_glow(dst, mesh: Mesh, centre, scale: float, rot: np.ndarray, *,
                 gain: float = 0.95, glow: float = 0.55, **kw):
     """Render a mesh at FULL resolution into a small scratch ROI, then add it.
@@ -371,13 +403,16 @@ def render_glow(dst, mesh: Mesh, centre, scale: float, rot: np.ndarray, *,
     if mesh.V is None or scale <= 0.5 or not np.isfinite(centre).all():
         return None
     hh, ww = dst.shape[:2]
-    r = screen_radius(mesh, scale) + 8.0
-    if not math.isfinite(r) or r > max(ww, hh) * 2.0:
+    box = mesh_bbox(mesh, centre, scale, rot, kw.get("explode", 0.0))
+    if box is None:
         return None
-    x0 = int(max(0, math.floor(centre[0] - r)))
-    x1 = int(min(ww, math.ceil(centre[0] + r)))
-    y0 = int(max(0, math.floor(centre[1] - r)))
-    y1 = int(min(hh, math.ceil(centre[1] + r)))
+    pad = 8.0
+    if max(box[2] - box[0], box[3] - box[1]) > max(ww, hh) * 4.0:
+        return None
+    x0 = int(max(0, math.floor(box[0] - pad)))
+    x1 = int(min(ww, math.ceil(box[2] + pad)))
+    y0 = int(max(0, math.floor(box[1] - pad)))
+    y1 = int(min(hh, math.ceil(box[3] + pad)))
     if x1 - x0 < 6 or y1 - y0 < 6:
         return None
     buf = np.zeros((y1 - y0, x1 - x0, 3), np.uint8)
