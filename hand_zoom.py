@@ -178,9 +178,27 @@ def build_landmarker(model_path: Path):
     return tasks.vision.HandLandmarker.create_from_options(options)
 
 
+DETECT_WIDTH = 640      # the landmarker's own input size; see detect_frame
+
+
 def detect_frame(landmarker, frame_bgr: np.ndarray, timestamp_ms: int):
-    """Run the landmarker on one BGR frame; returns raw result object."""
-    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    """Run the landmarker on one BGR frame; returns raw result object.
+
+    The frame is scaled down to DETECT_WIDTH first.  The model works at a small
+    fixed input size internally anyway, so nothing is lost by not feeding it
+    720p - but the colour convert, the copy and the pre-processing all scale
+    with the pixels, and doing them on a quarter of the data roughly halves the
+    per-frame tracking cost.  Landmarks come back NORMALISED, so they map onto
+    the full-size frame with no correction at all.  Faster frames are what
+    tracking actually feels like: a gesture that is sampled twice as often
+    follows the hand instead of lagging behind it.
+    """
+    src = frame_bgr
+    if src.shape[1] > DETECT_WIDTH:
+        k = DETECT_WIDTH / float(src.shape[1])
+        src = cv2.resize(src, (DETECT_WIDTH, max(2, int(round(src.shape[0] * k)))),
+                         interpolation=cv2.INTER_AREA)
+    rgb = cv2.cvtColor(src, cv2.COLOR_BGR2RGB)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
     return landmarker.detect_for_video(mp_image, timestamp_ms)
 
@@ -221,8 +239,8 @@ def curl_features(landmarks) -> dict:
     return curls
 
 
-FIST_CURL = 0.62          # a finger below this is folded
-FIST_MEAN = 0.60          # ...and the whole hand has to be closed on average
+FIST_CURL = 0.66          # a finger below this is folded
+FIST_MEAN = 0.64          # ...and the whole hand has to be closed on average
 
 
 def is_fist(curls: dict) -> bool:
@@ -351,21 +369,23 @@ class GestureTracker:
       ('pull', feat)     a pinching hand travelled ~one hand-length while
                          still pinched -> the summon gesture
       ('unpinch', feat)  the pinch opened again
-      ('fist', feat)     ONE hand held a fist for FIST_HOLD, with no other
-                         hand pinching -> blueprint
+      ('fist', feat)     ONE hand held a fist for FIST_HOLD and then OPENED,
+                         with no other hand pinching.  Firing on the release
+                         rather than on the hold is what makes it feel like
+                         pulling a glove back on.
 
     Per-hand features are EMA-smoothed (matched by palm proximity), and hands
     that drop out for a few frames keep their state ("ghosting") so a tracking
     hiccup never cancels a gesture mid-way.
     """
 
-    FIST_HOLD = 0.55        # seconds one fist must be held
+    FIST_HOLD = 0.60        # seconds one fist must be held before releasing
     GRAB_ON = 0.30          # pinch3 below this -> pinch begins
     GRAB_OFF = 0.46         # pinch3 above this -> pinch ends
     PINCH_OPEN = 0.50       # index must be at least this straight to pinch
     PINCH_CONFIRM = 2       # frames of confirmation before a pinch edge
-    GHOST_TTL = 0.35        # seconds a dropped hand keeps its state
-    PULL_DIST = 0.75        # pull distance, in hand-lengths
+    GHOST_TTL = 0.50        # seconds a dropped hand keeps its state
+    PULL_DIST = 0.60        # pull distance, in hand-lengths
     PULL_WINDOW = 2.5       # seconds a pinch stays eligible to become a pull
     PINCH_QUIET = 0.60      # seconds after a pinch that no fist may fire
 
@@ -399,16 +419,15 @@ class GestureTracker:
                 self._pinch_edges(s, t, events)
         if any(s["pinch"] for s in live):
             self._pinch_last = t
-        # -- one fist -> the blueprint --------------------------------------- #
+        # -- fist, held then RELEASED ---------------------------------------- #
         # Never while ANY hand is pinching, or just has been: taking a shooter
         # off means reaching across with one hand while the other holds still,
         # and a hand held still is usually half-closed.  Without this, trying
         # to detach a shooter spawned a blueprint instead.
-        if len(fists) == 1 and t - self._pinch_last > self.PINCH_QUIET:
-            s = fists[0]
-            if s["fist_since"] is not None and not s["fist_fired"] \
-                    and t - s["fist_since"] >= self.FIST_HOLD:
-                s["fist_fired"] = True
+        if len(fists) <= 1 and t - self._pinch_last > self.PINCH_QUIET:
+            for s in live:
+                if s["fist"] or not s.pop("fist_ready", False):
+                    continue
                 events.append(("fist", s["hand"]))
         return events
 
@@ -496,8 +515,12 @@ class GestureTracker:
             s["fist_fired"] = False
 
     def _pinch_edges(self, s, t, events):
-        if s["fist"] and s["fist_since"] is None and not s["fist_fired"]:
-            s["fist_since"] = t
+        if s["fist"]:
+            if s["fist_since"] is None and not s["fist_fired"]:
+                s["fist_since"] = t
+            # held long enough: armed, and it fires the moment the hand opens
+            if s["fist_since"] is not None and t - s["fist_since"] >= self.FIST_HOLD:
+                s["fist_ready"] = True
         p = s["pinch_ok"] and \
             s["pinch3"] < (self.GRAB_OFF if s["pinch"] else self.GRAB_ON)
         # confirm quickly, let go quickly: the counter saturates low and drains
@@ -608,14 +631,29 @@ class HoloDesk:
         self._end_drag(self._side(feat), t)
 
     def on_fist(self, feat, w, h, t):
+        """Fist, held and released.
+
+        If that hand is not wearing its shooter, this puts it back on - closing
+        your hand and opening it is how you'd pull a glove back over the wrist.
+        Only once you ARE wearing it does the same gesture call up the
+        blueprint, so the two can never fight over one hand.
+        """
+        side = self._side(feat)
+        sh = self.shooters[side]
+        if sh.state != "on":
+            wr = feat["wrist"] * np.array([w, h])
+            if sh.reattach(t, (float(wr[0]), float(wr[1] + 0.25 * h))):
+                self._auto[side] = True
+                self._log(f"[gesture] fist + release -> {side} shooter back on")
+                return
         if self.blueprint is not None and self.blueprint.dying is None:
             self.blueprint.dismiss()
             self._log("[gesture] fist -> blueprint dismissed")
             return
+        # docked as a sidebar on the side away from the hand that called it
         hand_x = float(feat["palm"][0])
-        dock = (0.76 * w, 0.46 * h) if hand_x < 0.5 else (0.24 * w, 0.46 * h)
-        length = float(np.linalg.norm((feat["mcp9"] - feat["wrist"]) * np.array([w, h])))
-        self.blueprint = Blueprint(dock, min(0.15 * h, max(0.085 * h, 1.2 * length)), 0.0)
+        dock = (0.82 * w, 0.45 * h) if hand_x < 0.5 else (0.18 * w, 0.45 * h)
+        self.blueprint = Blueprint(dock, 0.155 * h, 0.0)
         self._log("[gesture] fist -> web-shooter blueprint")
 
     def handle(self, events, w, h, t):
@@ -718,6 +756,8 @@ class HoloDesk:
     def draw(self, frame, t, feats, tracker, fps):
         h, w = frame.shape[:2]
         k = 0.5
+        if self.blueprint is not None:      # panel backing goes down first
+            self.blueprint.backdrop(frame)
         ov = np.zeros((max(2, int(h * k)), max(2, int(w * k)), 3), np.uint8)
         for side in ("Right", "Left"):
             self.shooters[side].draw(ov, k, t)
@@ -1244,10 +1284,10 @@ def selftest(args: argparse.Namespace) -> int:
     #    sit as a lump on the hand
     mesh = HM.shooter_mesh()
     xs = mesh.V[:, 0]
-    assert xs.min() < -1.5, "the bracer must run back up the forearm"
-    assert xs.max() < 0.8, "only the spinneret may cross forward of the wrist"
-    assert abs(xs.min()) > 2.0 * abs(xs.max()), \
-        "the bulk of the rig sits behind the wrist, on the forearm"
+    assert xs.min() < -2.0, "the bracer must run back up the forearm"
+    assert 0.9 < xs.max() < 1.8, "the wrap must carry over onto the hand"
+    assert abs(xs.min()) > 1.6 * abs(xs.max()), \
+        "the bulk of the rig still sits behind the wrist, on the forearm"
     print(f"[ok] shooter is a forearm bracer (x {xs.min():.2f}..{xs.max():.2f}, "
           f"origin at the wrist)")
 
@@ -1274,10 +1314,21 @@ def selftest(args: argparse.Namespace) -> int:
         "an open hand is not a fist"
     tr3 = GestureTracker()
     evs = []
-    for i in range(24):
+    for i in range(24):                        # 0.8 s closed: armed, not fired
         evs += tr3.feed([_fake_feat(True, fist=True)], i / 30.0)
+    assert not [e for e in evs if e[0] == "fist"], \
+        "a fist that is still closed must not fire - it fires on the release"
+    for i in range(4):                         # ...and now open the hand
+        evs += tr3.feed([_fake_feat(True, fist=False, pinch3=0.9)], 0.8 + i / 30.0)
     fists = [e for e in evs if e[0] == "fist"]
     assert len(fists) == 1, f"one fist must fire once per cycle (got {len(fists)})"
+    short = GestureTracker()
+    evs2 = []
+    for i in range(6):                         # 0.2 s: too short
+        evs2 += short.feed([_fake_feat(True, fist=True)], i / 30.0)
+    for i in range(4):
+        evs2 += short.feed([_fake_feat(True, fist=False, pinch3=0.9)], 0.2 + i / 30.0)
+    assert not [e for e in evs2 if e[0] == "fist"], "a quick fist must not fire"
     # a fist puts the thumb on the fingertips: it must never read as a pinch,
     # and a fist swung across the frame must never summon a shooter
     assert not [e for e in evs if e[0] in ("pinch", "pull")], \
@@ -1358,7 +1409,13 @@ def selftest(args: argparse.Namespace) -> int:
 
     # 11. desk: a 4 s grab arms the move lock, then the object follows the hand
     desk2 = HoloDesk(log=lambda *a: None)
+    # the first fist+release puts the missing shooter back on...
     desk2.handle([("fist", _fake_feat(True, fist=True))], 640, 480, 0.0)
+    assert desk2.shooters["Right"].state == "arrive", \
+        "fist + release must put the shooter back on that wrist"
+    assert desk2.blueprint is None, "...and must not also spawn a blueprint"
+    # ...and only once it is on does the same gesture call up the schematic
+    desk2.handle([("fist", _fake_feat(True, fist=True))], 640, 480, 0.1)
     assert desk2.blueprint is not None, "a fist must spawn the blueprint"
     bp_pos = desk2.blueprint.pos
     grab = _fake_feat(True, pinch3=0.10)

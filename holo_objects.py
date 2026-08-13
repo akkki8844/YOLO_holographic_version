@@ -137,6 +137,19 @@ class WebShooter:
         self.summon(t, from_px, park_px)
         return "summoned"
 
+    def reattach(self, t: float, from_px=None) -> bool:
+        """Put it back on: it flies home to the wrist from wherever it is."""
+        if self.state in ("on", "arrive"):
+            return False
+        src = self.pos if self.pos is not None else from_px
+        self._from = (float(src[0]), float(src[1])) if src is not None else (0.0, 0.0)
+        if self._park is None:
+            self._park = self._from
+        self.state = "arrive"
+        self.t0 = t
+        self._flash = t
+        return True
+
     def detach(self, t: float, px) -> bool:
         """Peel the shooter off the wrist - the real 'take it off' gesture.
 
@@ -280,11 +293,13 @@ class WebShooter:
         if self.pos is None or self.state == "off" or self.scale < 4.0:
             return
         alpha, wire, hot = self._shading(t)
-        # gain under 1: worn on the arm it has to stay hard-light, so your own
-        # forearm still reads through the shell
-        render_glow(frame, MODELS.shooter_mesh(1), self.pos, self.scale, self.rot,
-                    alpha=alpha, wire=wire, hot=hot, cull=True,
-                    gain=0.78, glow=0.42)
+        # cull=False and a part-wireframe shell: you see the FAR wall of the
+        # cuff through the near one, which is what makes it read as wrapped
+        # around the arm instead of pasted in front of it.  The LOD mesh keeps
+        # drawing both sides affordable.
+        render_glow(frame, MODELS.shooter_mesh(0), self.pos, self.scale, self.rot,
+                    alpha=alpha, wire=max(wire, 0.34), hot=hot, cull=False,
+                    gain=0.80, glow=0.42)
 
     def _fx(self, ov, k: float, t: float, c, s: float) -> None:
         if t - self._flash < 0.55:               # materialise ripple
@@ -324,6 +339,7 @@ PART_LABELS = {
     MODELS.WS_NOZZLE: "05 SPINNERET NOZZLE",
     MODELS.WS_TRIGGER: "06 TRIGGER PAD",
     MODELS.WS_POD: "07 STABILISER POD x2",
+    MODELS.WS_WRAP: "08 HAND WRAP / KNUCKLE PLATE",
 }
 _SPECS = ("SHEAR      120 MPa", "FLUID      2 x 40 ml", "PRESSURE   310 bar",
           "RANGE      18.0 m", "CYCLE      0.42 s", "MASS       0.31 kg")
@@ -429,7 +445,7 @@ class Blueprint:
                         fill=MONO_DIM, edge=MONO_GREY, wire=1.0, scan=False,
                         cull=True)
         render_mesh(ov, MODELS.shooter_mesh(), c, s, rot,
-                    explode=0.95 * spread, alpha=alpha,
+                    explode=0.95 * spread, alpha=min(1.0, alpha * 1.25),
                     fill=MONO_FILL, edge=MONO_WHITE,
                     wire=0.30 * spread, hot=hot, cull=True)
         # containment ring + orbiting motes (mono: this is a drafting hologram)
@@ -445,6 +461,30 @@ class Blueprint:
             f = (self.t - self.born) / 0.5
             _ring(ov, c, s * (3.2 - 2.0 * f), dim(MONO_WHITE, 0.8 * (1.0 - f)), 2)
 
+    def _panel(self, w: int, h: int):
+        c, s = self.pos, self.scale
+        return (int(c[0] - s * 2.3), int(c[1] - s * 2.0),
+                int(c[0] + s * 2.3), int(c[1] + s * 2.0))
+
+    def backdrop(self, frame) -> None:
+        """Darken the frame under the sidebar, BEFORE the holograms land on it.
+
+        A schematic drawn over a lit room is unreadable no matter how bright it
+        is; knocking the background back is what makes it a panel you can read
+        rather than a tangle of lines over your face.
+        """
+        alpha = self._alpha()
+        if alpha <= 0.02:
+            return
+        h, w = frame.shape[:2]
+        x0, y0, x1, y1 = self._panel(w, h)
+        x0, y0 = max(0, x0 - 16), max(0, y0 - 34)
+        x1, y1 = min(w, x1 + 16), min(h, y1 + 34)
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            return
+        roi = frame[y0:y1, x0:x1]
+        roi[:] = (roi * (1.0 - 0.55 * alpha)).astype(np.uint8)
+
     def annotate(self, frame, t: float) -> None:
         """Crisp full-resolution callouts, dimension lines and the spec block."""
         alpha = self._alpha()
@@ -456,9 +496,10 @@ class Blueprint:
         spread = self._phase()
         mesh = MODELS.shooter_mesh()
         col = dim(MONO_GREY, 0.9 * alpha)
-        # frame + title block
-        x0, y0 = int(c[0] - s * 2.3), int(c[1] - s * 2.0)
-        x1, y1 = int(c[0] + s * 2.3), int(c[1] + s * 2.0)
+        x0, y0, x1, y1 = self._panel(w, h)
+        cv2.rectangle(hud, (max(0, x0 - 16), max(0, y0 - 34)),
+                      (min(w, x1 + 16) - 1, min(h, y1 + 34) - 1),
+                      dim(MONO_GREY, 0.55 * alpha), 1, cv2.LINE_AA)
         for (ax, ay, bx, by) in ((x0, y0, 1, 1), (x1, y0, -1, 1),
                                  (x0, y1, 1, -1), (x1, y1, -1, -1)):
             cv2.line(hud, (ax, ay), (ax + bx * 26, ay), col, 1, cv2.LINE_AA)

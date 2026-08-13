@@ -114,8 +114,8 @@ class Hud:
             x += wlab + 12
         text(ov, "PINCH+PULL = SHOOTER ON OTHER WRIST   |   PINCH A WORN SHOOTER"
                  " + PULL = TAKE IT OFF", (28, h - 38), 0.34, dim(HOLO_BLUE, 0.85))
-        text(ov, "FIST = BLUEPRINT   |   HOLD GRAB 4s = MOVE",
-             (28, h - 20), 0.34, dim(HOLO_BLUE, 0.85))
+        text(ov, "FIST 0.6s + OPEN = WEAR IT BACK (AGAIN = BLUEPRINT)   |   "
+                 "HOLD GRAB 4s = MOVE", (28, h - 20), 0.34, dim(HOLO_BLUE, 0.85))
 
     def _hands(self, ov, w, h, t, ctx):
         for hnd in ctx.get("hands", []):

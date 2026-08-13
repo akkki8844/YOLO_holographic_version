@@ -20,7 +20,8 @@ import numpy as np
 from holo3d import Mesh
 
 # -- web-shooter part ids (explode directions live with the geometry) -------- #
-WS_BAND, WS_HOUSING, WS_CART, WS_BARREL, WS_NOZZLE, WS_TRIGGER, WS_POD = range(7)
+(WS_BAND, WS_HOUSING, WS_CART, WS_BARREL, WS_NOZZLE, WS_TRIGGER, WS_POD,
+ WS_WRAP) = range(8)
 
 _CACHE: dict = {}
 
@@ -111,6 +112,18 @@ def _build_shooter(detail: int = 1) -> Mesh:
         m.box((-1.45, 0.10, sz * 0.58), (0.80, 0.12, 0.045), 0.85)
         if detail:
             m.ellipsoid((-0.68, 0.14, sz * 0.60), (0.07, 0.07, 0.04), 7, 3, 1.0)
+    # 8. the hand wrap: straps that carry on over the wrist and close around
+    #    the back of the hand, so the rig is worn rather than parked on the arm
+    m.part(WS_WRAP, (0.9, 0.30, 0.0))
+    for x, r in ((0.42, 0.50), (0.95, 0.46)):            # two closed straps
+        m.torus((x, 0.10, 0.0), (1, 0.10, 0), r, 0.06, maj, 4, 0.95, squash=SQ)
+    m.box((0.70, 0.40, 0.0), (0.42, 0.06, 0.26), 1.0)    # knuckle plate
+    m.box((1.18, 0.34, 0.0), (0.14, 0.05, 0.20), 0.85)
+    for sz in (-1, 1):                                   # side rails to the plate
+        m.box((0.70, 0.16, sz * 0.44), (0.46, 0.05, 0.05), 0.8)
+    if detail:
+        m.torus((0.70, 0.44, 0.0), (0, 1, 0), 0.20, 0.03, 10, 4, 0.9)
+
     # a bracer is long and slim: authored full-width, then narrowed across so
     # it hugs the forearm instead of swallowing it
     return m.slim(0.68).compile()
