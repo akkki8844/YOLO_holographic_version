@@ -111,6 +111,7 @@ class WebShooter:
         self._lock = -9.0
         self._drag_off = (0.0, 0.0)
         self._fr = None
+        self._webpose = False
 
     # -- lifecycle ---------------------------------------------------------- #
     def active(self) -> bool:
@@ -200,6 +201,7 @@ class WebShooter:
     def update(self, dt: float, t: float, feat, w: int, h: int) -> None:
         fr = hand_frame(feat, w, h)
         self._fr = fr
+        self._webpose = bool(feat is not None and feat.get("webpose", False))
         self.spin += dt
         if fr is not None:
             # the model origin is the wrist itself: the bracer runs back up the
@@ -326,6 +328,38 @@ class WebShooter:
                        dim(HOLO_CYAN, pulse * 0.7), 1, cv2.LINE_AA)
             cv2.circle(ov, (int(nozzle[0]), int(nozzle[1])), max(1, int(0.05 * s)),
                        dim(HOLO_WHITE, pulse), -1, cv2.LINE_AA)
+            # the web-shoot pose snaps a targeting line out of the nozzle:
+            # dotted filament along the aim axis with a reticle at the end
+            if getattr(self, "_webpose", False):
+                self._webline(ov, c, s, t)
+
+    def _webline(self, ov, c, s, t) -> None:
+        """A thin holographic web-line from the spinneret toward the aim."""
+        if self._fr is None:
+            return
+        p0 = project(np.array([[0.60, 0.45, 0.0]]), c, s, self.rot)[0]
+        p1 = project(np.array([[2.6, 0.48, 0.0]]), c, s, self.rot)[0]
+        dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+        d = math.hypot(dx, dy)
+        if d < 4.0:
+            return
+        ux, uy = dx / d, dy / d
+        ln = min(0.55 * ov.shape[1], d)
+        col = dim(HOLO_CYAN, 0.42 + 0.25 * math.sin(t * 5.0))
+        pos = 0.0
+        while pos < ln:                     # dotted filament
+            e = min(ln, pos + 0.09 * s)
+            cv2.line(ov, (int(p0[0] + ux * pos), int(p0[1] + uy * pos)),
+                     (int(p0[0] + ux * e), int(p0[1] + uy * e)), col, 1, cv2.LINE_AA)
+            pos = e + 0.05 * s
+        ex, ey = p0[0] + ux * ln, p0[1] + uy * ln     # target reticle
+        rr = max(3, int(0.14 * s))
+        cv2.circle(ov, (int(ex), int(ey)), rr, col, 1, cv2.LINE_AA)
+        cv2.circle(ov, (int(ex), int(ey)), max(1, rr // 3), col, -1, cv2.LINE_AA)
+        for gx, gy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            cv2.line(ov, (int(ex + gx * rr * 1.6), int(ey + gy * rr * 1.6)),
+                     (int(ex + gx * rr * 2.3), int(ey + gy * rr * 2.3)),
+                     col, 1, cv2.LINE_AA)
 
 
 # --------------------------------------------------------------------------- #
@@ -340,6 +374,7 @@ PART_LABELS = {
     MODELS.WS_TRIGGER: "06 TRIGGER PAD",
     MODELS.WS_POD: "07 STABILISER POD x2",
     MODELS.WS_WRAP: "08 HAND WRAP / KNUCKLE PLATE",
+    MODELS.WS_REACTOR: "09 ARC REACTOR / CORE",
 }
 _SPECS = ("SHEAR      120 MPa", "FLUID      2 x 40 ml", "PRESSURE   310 bar",
           "RANGE      18.0 m", "CYCLE      0.42 s", "MASS       0.31 kg")
@@ -563,3 +598,129 @@ def _dimline(img, p1, p2, colour, dash=8, gap=6):
     for (px, py) in ((x1, y1), (x2, y2)):
         cv2.line(img, (int(px - uy * 6), int(py + ux * 6)),
                  (int(px + uy * 6), int(py - ux * 6)), colour, 1, cv2.LINE_AA)
+
+
+# --------------------------------------------------------------------------- #
+# PalmProjector: the hologram that materialises above an open palm
+# --------------------------------------------------------------------------- #
+class PalmProjector:
+    """A Stark palm-projection: a holographic screen hovering over the hand.
+
+    Continuous rather than toggled - it fades in while the palm stays open and
+    spread (the resting hand is open, so the projector is the ambient furniture
+    of the AR desk), tracks the palm in 3D, and fades out the moment the hand
+    closes.  A small rotating web-shooter holo plays on the screen, so the
+    projection reads as a live HUD rather than a static decal.
+    """
+
+    ARM = 0.45                  # seconds an open palm must hold to project
+    FADE_OUT = 0.30             # seconds to dissolve once the palm closes
+
+    def __init__(self, side: str):
+        self.side = side
+        self.pos = None             # screen centre, full-resolution px
+        self._fr = None
+        self._held = 0.0
+        self._last_hold = None
+        self._released_at = None
+
+    # -- desk-driven lifecycle --------------------------------------------- #
+    def hold(self, t: float) -> None:
+        if self._last_hold is not None:
+            self._held += max(0.0, t - self._last_hold)
+        self._last_hold = t
+        self._released_at = None
+
+    def release(self, t: float) -> None:
+        if self._last_hold is not None:
+            self._released_at = t
+        self._last_hold = None
+
+    def dead(self, t: float) -> bool:
+        if self._last_hold is not None:
+            return False
+        return (self._released_at is not None
+                and t - self._released_at > self.FADE_OUT + 0.15)
+
+    def track(self, feat, w: int, h: int) -> None:
+        fr = hand_frame(feat, w, h)
+        self._fr = fr
+        if fr is None:
+            return
+        # the screen hovers just past the fingertips, tilted with the hand
+        self.pos = (fr["M"][0] + fr["ax"][0] * 0.92 * fr["L"],
+                    fr["M"][1] + fr["ax"][1] * 0.92 * fr["L"])
+
+    def _alpha(self, t: float) -> float:
+        arm = smoothstep(clamp01(self._held / self.ARM))
+        if self._last_hold is not None:
+            return arm
+        if self._released_at is None:
+            return 0.0
+        return arm * (1.0 - clamp01((t - self._released_at) / self.FADE_OUT))
+
+    # -- render ------------------------------------------------------------- #
+    def draw(self, ov, k: float, t: float) -> None:
+        if self.pos is None or self._fr is None:
+            return
+        alpha = self._alpha(t)
+        if alpha <= 0.03:
+            return
+        c = (self.pos[0] * k, self.pos[1] * k)
+        fr = self._fr
+        s = 1.05 * fr["L"] * k
+        th = fr["theta"]
+        # the light beam from the palm up into the screen
+        base = (fr["M"][0] * k, fr["M"][1] * k)
+        for i in range(7):
+            f = i / 7.0
+            bx = base[0] + (c[0] - base[0]) * f + 2.0 * math.sin(t * 6.0 + i) * f
+            by = base[1] + (c[1] - base[1]) * f
+            cv2.circle(ov, (int(bx), int(by)), max(1, int(1.4 * s * (1.0 - f))),
+                       dim(HOLO_CYAN, alpha * (0.5 - 0.35 * f)), -1, cv2.LINE_AA)
+        # the screen itself: a tilted holographic ring with ticks
+        cv2.ellipse(ov, (int(c[0]), int(c[1])),
+                    (int(s), int(s * 0.42)), math.degrees(th),
+                    0, 360, dim(HOLO_CYAN, alpha * 0.8), 2, cv2.LINE_AA)
+        cv2.ellipse(ov, (int(c[0]), int(c[1])),
+                    (int(s * 1.28), int(s * 0.54)), math.degrees(th),
+                    0, 360, dim(HOLO_DEEP, alpha * 0.5), 1, cv2.LINE_AA)
+        for i in range(8):
+            a = t * 0.9 + i * math.pi / 4.0
+            r0, r1 = s * 1.04, s * 1.04 + (4.0 if i % 2 == 0 else 8.0)
+            cv2.line(ov,
+                     (int(c[0] + math.cos(a) * r0 * 0.42), int(c[1] + math.sin(a) * r0)),
+                     (int(c[0] + math.cos(a) * r1 * 0.42), int(c[1] + math.sin(a) * r1)),
+                     dim(HOLO_WHITE, alpha * (0.5 + 0.3 * (i % 2))), 1, cv2.LINE_AA)
+        # charge ring when it is still arming
+        if self._held < self.ARM:
+            p = clamp01(self._held / self.ARM)
+            cv2.ellipse(ov, (int(c[0]), int(c[1])),
+                        (int(s * 1.6), int(s * 0.67)), math.degrees(th),
+                        -90, -90 + 360 * p, dim(HOLO_WHITE, alpha * 0.9), 2,
+                        cv2.LINE_AA)
+
+    def draw_sharp(self, frame, t: float) -> None:
+        """The holographic tablet + rotating mini-shooter, at full resolution."""
+        if self.pos is None or self._fr is None:
+            return
+        alpha = self._alpha(t)
+        if alpha <= 0.03:
+            return
+        fr = self._fr
+        s = 1.05 * fr["L"]
+        rot = rot_matrix(0.42 + 0.10 * math.sin(t * 0.8), -0.34,
+                         fr["theta"])
+        render_glow(frame, MODELS.palm_screen_mesh(), self.pos, s, rot,
+                    alpha=alpha, wire=0.30, cull=False, gain=0.80, glow=0.45)
+        # the rotating mini web-shooter playing on the screen
+        mini = rot_matrix(t * 1.4, 0.4, 0.15)
+        mc = (self.pos[0], self.pos[1] - 0.06 * s)
+        render_glow(frame, MODELS.shooter_mesh(0), mc, 0.40 * s, mini,
+                    alpha=alpha, wire=0.45, cull=False, gain=0.85, glow=0.5)
+        # corner tag
+        tag = f"{self.side.upper()} PALM  //  AR LINK"
+        cv2.putText(frame, tag, (int(self.pos[0] - s * 0.9),
+                                 int(self.pos[1] + s * 0.72)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.34,
+                    dim(HOLO_CYAN, 0.75 * alpha), 1, cv2.LINE_AA)

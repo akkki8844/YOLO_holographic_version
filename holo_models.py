@@ -21,7 +21,7 @@ from holo3d import Mesh
 
 # -- web-shooter part ids (explode directions live with the geometry) -------- #
 (WS_BAND, WS_HOUSING, WS_CART, WS_BARREL, WS_NOZZLE, WS_TRIGGER, WS_POD,
- WS_WRAP) = range(8)
+ WS_WRAP, WS_REACTOR) = range(9)
 
 _CACHE: dict = {}
 
@@ -75,8 +75,13 @@ def _build_shooter(detail: int = 1) -> Mesh:
     m.box((-1.30, 0.62, 0.0), (0.80, 0.045, 0.18), 0.95)
     for i in range(4):                                   # heat vents
         m.box((-1.95 + i * 0.42, 0.67, 0.0), (0.055, 0.028, 0.13), 0.7)
-    m.disc((-0.40, 0.62, 0.0), (0, 1, 0), 0.10, 10, 1.0)  # status lens
-    m.torus((-0.40, 0.63, 0.0), (0, 1, 0), 0.125, 0.024, 10, 4, 0.9)
+    # the arc reactor: a Stark-pattern ring sunk into the dorsal deck, with a
+    # raised core lens.  Its white-hot pulse is drawn by the object layer.
+    m.part(WS_REACTOR, (0.25, 0.85, 0.0))
+    m.torus((-0.40, 0.63, 0.0), (0, 1, 0), 0.185, 0.030, 12, 4, 1.0)
+    m.torus((-0.40, 0.64, 0.0), (0, 1, 0), 0.135, 0.020, 10, 4, 0.9)
+    m.disc((-0.40, 0.63, 0.0), (0, 1, 0), 0.115, 10, 1.0)
+    m.ellipsoid((-0.40, 0.66, 0.0), (0.075, 0.045, 0.075), 8, 4, 1.15)
 
     # 3. twin web-fluid cartridges, slung either side of the deck
     m.part(WS_CART, (0.0, -1.30, 0.40))
@@ -99,7 +104,10 @@ def _build_shooter(detail: int = 1) -> Mesh:
     m.tube((0.34, 0.44, 0.0), (0.58, 0.45, 0.0), 0.085, 0.052, seg, 1.0)
     if detail:
         m.torus((0.54, 0.45, 0.0), (1, 0, 0), 0.072, 0.022, 9, 4, 1.0)
-    m.disc((0.59, 0.45, 0.0), (1, 0, 0), 0.045, 8, 1.0)
+        m.torus((0.50, 0.45, 0.0), (1, 0, 0), 0.030, 0.016, 8, 4, 1.0)
+        m.disc((0.62, 0.455, 0.0), (1, 0, 0), 0.030, 8, 1.0)
+    else:
+        m.disc((0.59, 0.45, 0.0), (1, 0, 0), 0.045, 8, 1.0)
 
     # 6. trigger pad, on the palm side under the wrist
     m.part(WS_TRIGGER, (0.0, -1.20, -0.60))
@@ -200,6 +208,49 @@ def _build_suit() -> Mesh:
 
 def suit_mesh() -> Mesh:
     return _cached("suit", _build_suit)
+
+
+# --------------------------------------------------------------------------- #
+# The chest arc reactor: the Stark signature, worn over the sternum
+# --------------------------------------------------------------------------- #
+def _build_reactor() -> Mesh:
+    m = Mesh()
+    m.part(0, (0.0, 0.0, 0.0))
+    # outer glow ring, inner focusing ring, then the white-hot core
+    m.torus((0.0, 0.0, 0.0), (0, 0, 1), 1.00, 0.16, 16, 5, 1.0)
+    m.torus((0.0, 0.0, 0.0), (0, 0, 1), 0.62, 0.11, 14, 5, 0.95)
+    m.disc((0.0, 0.0, 0.0), (0, 0, 1), 0.40, 12, 1.0)
+    m.ellipsoid((0.0, 0.0, 0.16), (0.30, 0.30, 0.14), 8, 4, 1.2)
+    for i in range(3):                        # conductor pips on the ring
+        th = math.pi * 2.0 * i / 3.0
+        m.ellipsoid((math.sin(th) * 0.80, math.cos(th) * 0.80, 0.0),
+                    (0.10, 0.10, 0.07), 6, 3, 1.0)
+    return m.compile()
+
+
+def reactor_mesh() -> Mesh:
+    return _cached("reactor", _build_reactor)
+
+
+# --------------------------------------------------------------------------- #
+# The palm-screen: the thin holographic tablet a palm projection floats on
+# --------------------------------------------------------------------------- #
+def _build_palm_screen() -> Mesh:
+    m = Mesh()
+    m.part(0, (0.0, 0.0, 0.0))
+    # a slim slab facing the viewer, slightly tilted, with a bezel ring
+    m.box((0.035, 0.0, 0.0), (0.045, 0.42, 0.30), 0.95)
+    m.torus((0.06, 0.0, 0.0), (1, 0, 0), 0.255, 0.030, 12, 4, 1.0)
+    m.torus((0.07, 0.0, 0.0), (1, 0, 0), 0.255, 0.014, 12, 4, 0.9)
+    for i in range(4):                        # corner data nodes
+        th = math.pi * 2.0 * i / 4.0
+        m.ellipsoid((0.09 + math.sin(th) * 0.19, math.cos(th) * 0.19, 0.0),
+                    (0.035, 0.035, 0.02), 6, 3, 1.0)
+    return m.compile()
+
+
+def palm_screen_mesh() -> Mesh:
+    return _cached("palm_screen", _build_palm_screen)
 
 
 # --------------------------------------------------------------------------- #

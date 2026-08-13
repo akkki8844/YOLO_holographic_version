@@ -62,6 +62,8 @@ class Hud:
         self._bottom(ov, w, h, t, ctx)
         self._hands(ov, w, h, t, ctx)
         self._drags(ov, t, ctx)
+        if ctx.get("guide"):
+            self._guide(ov, w, h, t)
         if ctx.get("debug"):
             self._debug(ov, w, h, ctx)
         self._scanline(ov, w, h, t)
@@ -93,6 +95,10 @@ class Hud:
         hands = int(ctx.get("hand_count", 0))
         right = f"{stamp}   {fps:4.1f} FPS   HANDS {hands}/2"
         text(ov, right, (w - 28 - 8 * len(right) * 0.62, 40), 0.42, col)
+        # the JARVIS-style status line - real state only, never invented
+        status = str(ctx.get("status", "STANDBY"))
+        s_col = dim(HOLO_WHITE, 0.95) if "ONLINE" in status else dim(HOLO_CYAN, 0.9)
+        text(ov, status, (w - 28 - 9.1 * len(status) * 0.42, 60), 0.42, s_col)
 
     def _bottom(self, ov, w, h, t, ctx):
         # status chips: the only readout on screen, and every one of them is
@@ -112,10 +118,10 @@ class Hud:
                 cv2.rectangle(ov, (x, by + 13), (x + int(wlab * clamp01(prog)), by + 16),
                               dim(HOLO_WHITE, 0.85), -1)
             x += wlab + 12
-        text(ov, "PINCH+PULL = SHOOTER ON OTHER WRIST   |   PINCH A WORN SHOOTER"
-                 " + PULL = TAKE IT OFF", (28, h - 38), 0.34, dim(HOLO_BLUE, 0.85))
-        text(ov, "FIST 0.6s + OPEN = WEAR IT BACK (AGAIN = BLUEPRINT)   |   "
-                 "HOLD GRAB 4s = MOVE", (28, h - 20), 0.34, dim(HOLO_BLUE, 0.85))
+        text(ov, "WEB-SHOOT PINCH + PULL = SUMMON / TAKE OFF   |   FIST 0.6s + OPEN ="
+                 " WEAR BACK / BLUEPRINT", (28, h - 38), 0.34, dim(HOLO_BLUE, 0.85))
+        text(ov, "BOTH FISTS 0.7s = BODY GEAR   |   OPEN PALM = HOLOGRAM   |   "
+                 "GRAB 4s = MOVE   |   G = GUIDE", (28, h - 20), 0.34, dim(HOLO_BLUE, 0.85))
 
     def _hands(self, ov, w, h, t, ctx):
         for hnd in ctx.get("hands", []):
@@ -136,6 +142,18 @@ class Hud:
             if hnd.get("pull_p", 0.0) > 0.02:
                 arc(ov, (px, py), r * 1.5, 90, 90 + 360 * clamp01(hnd["pull_p"]),
                     dim(HOLO_CYAN, 0.9), 2)
+            gp = clamp01(hnd.get("gear_p", 0.0))      # both-fists -> gear
+            if gp > 0.02:
+                arc(ov, (px, py), r * 1.7, 180, 180 + 360 * gp,
+                    dim(HOLO_WHITE, 0.95), 2)
+                text(ov, "GEAR", (px + r * 1.7, py - r * 1.7), 0.34,
+                     dim(HOLO_WHITE, 0.9))
+            if hnd.get("webpose"):                     # web-shoot pose locked
+                arc(ov, (px, py), r * 1.28, -35, 35, dim(HOLO_CYAN, 0.95), 2)
+                text(ov, "WEB", (px + r * 1.32, py - r * 1.32 - 4), 0.3,
+                     dim(HOLO_CYAN, 0.95))
+            if hnd.get("open") and not hnd.get("pinch"):
+                brackets(ov, (px, py), r * 1.55, dim(HOLO_BLUE, 0.5))
             if hnd.get("pinch"):
                 cv2.circle(ov, (int(px), int(py)), 5, dim(HOLO_WHITE, 0.95), -1,
                            cv2.LINE_AA)
@@ -173,6 +191,37 @@ class Hud:
                 text(ov, "MOVE LOCK", (px - r, py - r - 10), 0.38,
                      dim(HOLO_WHITE, 0.95))
 
+    def _guide(self, ov, w, h, t):
+        """The on-screen gesture guide (G key): what each pose does."""
+        lines = [
+            "GESTURE GUIDE  [G]",
+            "WEB-SHOOT PINCH + PULL .... summon a shooter on the OTHER wrist",
+            "  (thumb on index+middle, ring+pinky down)",
+            "PINCH WORN SHOOTER + PULL . take it off, drop it anywhere",
+            "FIST 0.6s + OPEN ......... wear it back / blueprint (again)",
+            "BOTH FISTS 0.7s + OPEN ... toggle BODY GEAR (R key too)",
+            "OPEN PALM ................ hologram above the palm",
+            "GRAB + HOLD 4s ........... move an object, release parks it",
+            "WEB-SHOOT POSE HELD ...... targeting line from the nozzle",
+            "D ....................... gesture debug readout",
+            "V ....................... record   R = gear   G = this panel",
+            "ESC / Q ................. quit",
+        ]
+        x = int(w * 0.62)
+        y0 = int(h * 0.24)
+        lh = 19
+        box_h = len(lines) * lh + 16
+        roi = ov[y0:y0 + box_h, x:x + int(w * 0.36)]
+        roi[:] = (roi * 0.35).astype(np.uint8)
+        cv2.rectangle(ov, (x, y0), (x + int(w * 0.36) - 1, y0 + box_h - 1),
+                      dim(HOLO_CYAN, 0.5), 1, cv2.LINE_AA)
+        for i, line in enumerate(lines):
+            strong = i == 0 or line.startswith("  ")
+            text(ov, line, (x + 12, y0 + 20 + i * lh),
+                 0.36 if not strong else 0.30,
+                 dim(HOLO_WHITE, 0.95) if i == 0 else
+                 dim(HOLO_DEEP if strong else HOLO_CYAN, 0.85))
+
     def _debug(self, ov, w, h, ctx):
         """Raw gesture numbers, so a gesture that will not fire can be seen.
 
@@ -180,11 +229,11 @@ class Hud:
         an unsatisfied one stays dim blue.
         """
         th = ctx.get("thresholds", {})
-        grab_on = float(th.get("grab_on", 0.30))
-        fist_curl = float(th.get("fist_curl", 0.62))
+        grab_on = float(th.get("grab_on", 0.42))
+        fist_curl = float(th.get("fist_curl", 0.55))
         x, y = 28, int(h * 0.60)
         text(ov, "GESTURE DEBUG  [D]", (x, y), 0.38, dim(HOLO_WHITE, 0.95))
-        text(ov, f"fist: finger curl < {fist_curl:.2f}   pinch: dist < {grab_on:.2f}",
+        text(ov, f"fist: finger curl > {fist_curl:.2f}   pinch: dist < {grab_on:.2f}",
              (x, y + 16), 0.32, dim(HOLO_BLUE, 0.9))
         y += 38
         if not ctx.get("hands"):
@@ -194,7 +243,7 @@ class Hud:
             curls = hnd.get("curls", [])
             text(ov, f"{hnd['side']}  I M R P T", (x, y), 0.34, dim(HOLO_CYAN, 0.95))
             for i, v in enumerate(curls):
-                lit = v < fist_curl and i < 4
+                lit = v > fist_curl and i < 4
                 text(ov, f"{v:.2f}", (x + 54 + i * 40, y), 0.34,
                      dim(HOLO_WHITE if lit else HOLO_BLUE, 0.95))
             pd = hnd.get("pinch3", 1.0)

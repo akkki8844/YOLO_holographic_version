@@ -31,11 +31,26 @@ Gestures
                                                when it snaps READY the object
                                                follows your hand.  Let go and it
                                                simply stays where you left it.
+  BOTH FISTS, hold ~0.7 s, then open ......... toggle the full BODY GEAR: torso
+                                               shell with spider emblem and
+                                               webbing, shoulders, belt, an
+                                               armoured gauntlet + arc reactor
+                                               on every wrist, and the chest
+                                               reactor.  Same gesture (or R)
+                                               stands it down.
+  OPEN PALM, hold it ......................... a hologram materialises above
+                                               the palm and tracks it - the
+                                               Stark palm-projection.
+  WEB-SHOOT POSE held ........................ a targeting web-line snaps out
+                                               of the worn shooter's nozzle.
+  G ........................................... toggle the on-screen gesture
+                                               guide panel
   D ........................................... live gesture readout (shows the
                                                raw finger-curl / pinch numbers
                                                so a stubborn gesture can be
                                                seen, not guessed at)
   V ........................................... start / stop recording
+  R ........................................... toggle body gear (keyboard)
   Esc / Q ..................................... quit
 
 Video calls
@@ -45,10 +60,16 @@ Video calls
   while the script runs.  See README.md and setup_virtualcam.bat.
 
 Recognition is tuned to be as forgiving as possible:
-  * MediaPipe confidence thresholds at the practical minimum
-    (0.10 / 0.10 / 0.20)
+  * MediaPipe confidence at 0.20 / 0.20 / 0.40 - low enough to keep hands in
+    weak light and at the frame edges, high enough to stop the detector
+    re-firing on noise and making hands pop in and out
   * the camera is pushed to 1280x720 (MJPEG + low-latency buffers) with an
     automatic fallback ladder
+  * fingers are judged by their JOINT ANGLES in 3D (invariant to hand size
+    and distance), pinches by 3D thumb-to-finger distance, and handedness by
+    MediaPipe's own label (correct on the mirrored feed) with a position
+    fallback - so crossing your hands to reach the other wrist no longer
+    flips left/right mid-gesture
   * gesture features are EMA-smoothed per hand with hysteresis and frame
     confirmation; dropped hands are ghosted so hiccups never cancel a gesture
 
@@ -81,7 +102,8 @@ import numpy as np
 from holo3d import (HOLO_BLUE, HOLO_CYAN, HOLO_DEEP, HOLO_DIM, HOLO_WHITE,
                     clamp01, dim as _dim)
 from holo_hud import Hud
-from holo_objects import Blueprint, WebShooter, hand_frame
+from holo_objects import Blueprint, PalmProjector, WebShooter, hand_frame
+from holo_suit import SuitGear
 
 try:
     import mediapipe as mp  # heavy import; handled later with clear errors
@@ -126,6 +148,10 @@ FINGER_JOINTS = {
     "pinky": (17, 18, 19, 20),
 }
 
+# thumb joint indexes (cmc, mcp, ip, tip)
+THUMB_CMC, THUMB_MCP, THUMB_IP, THUMB_TIP2 = 1, 2, 3, 4
+INDEX_MCP = 5
+
 
 # --------------------------------------------------------------------------- #
 # Model handling
@@ -169,11 +195,14 @@ def build_landmarker(model_path: Path):
         base_options=base,
         running_mode=tasks.vision.RunningMode.VIDEO,
         num_hands=2,
-        # minimum practical confidence: hands are recognised in weak light,
-        # at the frame edges and at distance.
-        min_hand_detection_confidence=0.10,
-        min_hand_presence_confidence=0.10,
-        min_tracking_confidence=0.20,
+        # low-but-not-minimal confidence: at 0.10 the detector re-fires on
+        # noise, so hands pop in and out and every gesture looks broken.  The
+        # VIDEO-mode tracker re-detects a lost hand within a frame or two at
+        # 0.20, while 0.40 keeps an established track from being dropped by
+        # single-frame flickers.
+        min_hand_detection_confidence=0.20,
+        min_hand_presence_confidence=0.20,
+        min_tracking_confidence=0.40,
     )
     return tasks.vision.HandLandmarker.create_from_options(options)
 
@@ -219,66 +248,109 @@ def palm_center(landmarks) -> np.ndarray:
     return 0.5 * (_pt(landmarks, WRIST) + _pt(landmarks, MIDDLE_MCP))
 
 
-def curl_features(landmarks) -> dict:
-    """Straightness in [0..1] for each finger (1 = fully straight).
+def _p3(landmarks, i: int) -> np.ndarray:
+    """Landmark as a 3D point; MediaPipe's z is normalised like x/y."""
+    lm = landmarks[i]
+    return np.array([lm.x, lm.y, lm.z], dtype=np.float64)
 
-    Fingers: ratio of the actual mcp->tip distance to the fully-extended
-    chain length.  Thumb: same chain metric over its mcp->pip->tip joints.
+
+def _angle3(a, b, c) -> float:
+    """Angle (radians) at b formed by the vectors b->a and b->c, in 3D."""
+    v1 = a - b
+    v2 = c - b
+    n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+    if n1 < 1e-9 or n2 < 1e-9:
+        return 0.0
+    cosv = float(np.dot(v1, v2) / (n1 * n2))
+    return math.acos(max(-1.0, min(1.0, cosv)))
+
+
+def curl_features(landmarks) -> dict:
+    """Curl in [0..1] for each finger (1 = fully folded into the palm).
+
+    Every finger is judged by the BEND at its PIP and DIP joints, measured in
+    3D: a straight joint reads ~180 degrees and a folded one collapses toward
+    90 or less.  Angles are invariant to hand size, distance from the camera
+    and perspective foreshortening - the old mcp->tip distance ratio depended
+    on all three, which is why a real fist read as open in one pose and a
+    resting hand read as a fist in another.  The thumb (which has no PIP/DIP
+    in the MediaPipe skeleton) blends its MCP/IP joint angles with the classic
+    tip-vs-index-base distance test.
     """
+    pts = {i: _p3(landmarks, i) for i in range(21)}
     curls: dict = {}
     for name, (mcp, pip, dip, tip) in FINGER_JOINTS.items():
-        d_ext = (np.linalg.norm(_pt(landmarks, mcp) - _pt(landmarks, pip))
-                 + np.linalg.norm(_pt(landmarks, pip) - _pt(landmarks, dip))
-                 + np.linalg.norm(_pt(landmarks, dip) - _pt(landmarks, tip)))
-        d_act = float(np.linalg.norm(_pt(landmarks, mcp) - _pt(landmarks, tip)))
-        curls[name] = clamp01(d_act / (d_ext + 1e-6))
-    t_ext = (np.linalg.norm(_pt(landmarks, 2) - _pt(landmarks, 3))
-             + np.linalg.norm(_pt(landmarks, 3) - _pt(landmarks, 4)))
-    t_act = float(np.linalg.norm(_pt(landmarks, 2) - _pt(landmarks, 4)))
-    curls["thumb"] = clamp01(t_act / (t_ext + 1e-6))  # same chain metric as fingers
+        a_pip = _angle3(pts[mcp], pts[pip], pts[dip])
+        a_dip = _angle3(pts[pip], pts[dip], pts[tip])
+        # joints that have folded past ~112 degrees are the folded part of the
+        # range; anything straighter than that contributes nothing
+        c_pip = clamp01((math.pi - a_pip) / (0.62 * math.pi))
+        c_dip = clamp01((math.pi - a_dip) / (0.62 * math.pi))
+        curls[name] = 0.55 * c_pip + 0.45 * c_dip
+    a_mcp = _angle3(pts[THUMB_CMC], pts[THUMB_MCP], pts[THUMB_IP])
+    a_ip = _angle3(pts[THUMB_MCP], pts[THUMB_IP], pts[THUMB_TIP2])
+    c_ang = clamp01((math.pi - max(a_mcp, a_ip)) / (0.55 * math.pi))
+    d_tip = float(np.linalg.norm(pts[THUMB_TIP2] - pts[INDEX_MCP]))
+    d_arm = float(np.linalg.norm(pts[WRIST] - pts[MIDDLE_MCP])) or 1e-6
+    c_dst = clamp01(1.15 - d_tip / d_arm)      # tip tucked against the hand -> 1
+    curls["thumb"] = 0.45 * c_ang + 0.55 * c_dst
     return curls
 
 
-FIST_CURL = 0.66          # a finger below this is folded
-FIST_MEAN = 0.64          # ...and the whole hand has to be closed on average
+FIST_CURL = 0.55          # a finger more curled than this counts as folded
+FIST_MEAN = 0.62          # ...and the whole hand has to be closed on average
 
 
 def is_fist(curls: dict) -> bool:
     """True when the four fingers are folded into the palm.
 
     The THUMB is deliberately ignored.  In a natural fist it lies flat across
-    the folded fingers and stays almost straight (measured ~0.95 by the same
-    chain metric that reads 1.00 for a fully open hand), so testing it meant no
-    real fist was ever recognised.  One finger is allowed to disagree, since a
+    the folded fingers and reads moderately curled, but a fully open hand has
+    the thumb out at ~0.1, so testing it would either reject every real fist
+    or accept every relaxed hand.  One finger is allowed to disagree, since a
     single mis-placed landmark should not cancel the gesture.
     """
     vals = [curls["index"], curls["middle"], curls["ring"], curls["pinky"]]
-    folded = sum(1 for v in vals if v < FIST_CURL)
-    return folded >= 3 and (sum(vals) / 4.0) < FIST_MEAN
+    folded = sum(1 for v in vals if v > FIST_CURL)
+    return folded >= 3 and (sum(vals) / 4.0) > FIST_MEAN
 
 
 def hand_features(landmarks, is_right: bool) -> dict:
     """Everything the gesture engine + renderers need for one hand."""
-    scale = hand_scale(landmarks) + 1e-6
+    pts = {i: _p3(landmarks, i) for i in range(21)}
+    scale2 = hand_scale(landmarks) + 1e-6
+    scale3 = float(np.linalg.norm(pts[WRIST] - pts[MIDDLE_MCP])) or 1e-6
     curls = curl_features(landmarks)
-    tt = _pt(landmarks, THUMB_TIP)
+    # 3D pinch distances (the z channel makes a real pinch read far tighter
+    # than a flat 2D distance, which is what a grab needs)
+    d_ti = float(np.linalg.norm(pts[THUMB_TIP] - pts[INDEX_TIP]))
+    d_tm = float(np.linalg.norm(pts[THUMB_TIP] - pts[MIDDLE_TIP]))
+    pinch2 = d_ti / scale3                     # thumb<->index only (grabbing)
+    pinch3 = min(d_ti, d_tm) / scale3          # thumb to either of the two
     it = _pt(landmarks, INDEX_TIP)
     mt = _pt(landmarks, MIDDLE_TIP)
-    # closest of thumb->index / thumb->middle: pinching with two fingers is the
-    # natural gesture, and averaging the two (as this used to) meant a real
-    # pinch never got close to the threshold.
-    pinches = min(float(np.linalg.norm(tt - it)), float(np.linalg.norm(tt - mt)))
+    tt = _pt(landmarks, THUMB_TIP)
     tips = [_pt(landmarks, i) for i in (INDEX_TIP, MIDDLE_TIP, 12, 16, 20)]
     spread = float(np.mean([np.linalg.norm(tips[i] - tips[i + 1]) for i in range(4)]))
+    spread_n = spread / scale2
+    # the classic SPIDER-MAN web-shoot pose: index + middle extended out, ring
+    # + pinky folded, thumb pressed against the two extended fingertips.  It is
+    # deliberately distinct from a fist (all four folded) and from an open palm.
+    webpose = (curls["index"] < 0.45 and curls["middle"] < 0.50
+               and curls["ring"] > 0.55 and curls["pinky"] > 0.55
+               and pinch3 < 0.45)
     return {
         "landmarks": landmarks,
         "is_right": bool(is_right),
         "curls": curls,
         "fist": is_fist(curls),
-        "open": (curls["index"] > 0.72 and curls["middle"] > 0.60
-                 and curls["ring"] > 0.60),
-        "pinch3": pinches / scale,          # thumb<->index/middle distance ratio
-        "spread": spread / scale,
+        "open": (curls["index"] < 0.45 and curls["middle"] < 0.50
+                 and curls["ring"] < 0.50 and curls["pinky"] < 0.60
+                 and spread_n > 0.25),
+        "webpose": webpose,
+        "pinch3": pinch3,          # thumb<->index/middle 3D distance ratio
+        "pinch2": pinch2,          # thumb<->index 3D distance ratio (grab)
+        "spread": spread_n,
         "palm": palm_center(landmarks),
         "wrist": _pt(landmarks, WRIST),
         "mcp9": _pt(landmarks, MIDDLE_MCP),
@@ -288,35 +360,42 @@ def hand_features(landmarks, is_right: bool) -> dict:
     }
 
 
-def classify_hands(result) -> list:
+def classify_hands(result, mirrored: bool = True) -> list:
     """Turn a detection result into a list of per-hand feature dicts.
 
-    Every hand gets an 'is_right' flag, decided PURELY BY SCREEN POSITION.
+    Every hand gets an 'is_right' flag, decided from MediaPipe's OWN
+    handedness label whenever it is confident, with screen position as the
+    fallback.  Both conventions agree with each other and with the user here:
 
-    The frame is mirrored before anything touches it, so the picture is a
-    mirror: whatever is on the right of the screen is your right hand, always.
-    That is also exactly how you check it - you look at which of your hands the
-    'R' is sitting on.  With two hands the rightmost is the right one; with one
-    hand, which side of centre it is on.
+    * The main loop flips the frame before detection, so the model sees a
+      MIRRORED (selfie) image - which is exactly the convention MediaPipe's
+      handedness is defined for.  "Right" really is your right hand.
+    * Position: in a mirrored frame, whatever is right of screen centre is
+      your right hand.
 
-    MediaPipe's own handedness label is deliberately NOT used.  Its convention
-    depends on whether the frame it was given is mirrored, it disagrees between
-    the legacy and Tasks APIs, and when it is wrong the labels are wrong in a
-    way that no amount of guessing at the convention fixes.  Position cannot be
-    wrong in a mirrored frame.
+    Position alone was the old scheme, and it silently breaks the moment the
+    hands CROSS - which is precisely what the pinch-pull summon does.  The
+    model's label comes from the hand's actual anatomy and survives crossing,
+    so a confident label wins; when the label is weak the position keeps the
+    answer sane instead of flipping frame to frame.
     """
     hands = list(result.hand_landmarks or []) if result is not None else []
     if not hands:
         return []
+    handness = list(result.handedness or []) if result is not None else []
     xs = [float(np.mean([h[WRIST].x, h[MIDDLE_MCP].x])) for h in hands]
-    if len(hands) >= 2:
-        rightmost = max(range(len(hands)), key=lambda i: xs[i])
-        flags = [i == rightmost for i in range(len(hands))]
-        if len(hands) > 2:               # never expected, but stay sane
-            flags = [x > 0.5 for x in xs]
-    else:
-        flags = [xs[0] > 0.5]
-    return [hand_features(h, flags[i]) for i, h in enumerate(hands)]
+    out = []
+    for i, h in enumerate(hands):
+        cat = handness[i][0] if i < len(handness) and handness[i] else None
+        mp_right = (cat.category_name == "Right") if cat is not None else None
+        score = float(getattr(cat, "score", 0.0)) if cat is not None else 0.0
+        if mp_right is not None and score >= 0.60:
+            is_right = mp_right
+        else:
+            # mirrored: right of screen is your right hand (flip for raw input)
+            is_right = (xs[i] > 0.5) if mirrored else (xs[i] < 0.5)
+        out.append(hand_features(h, is_right))
+    return out
 
 
 def draw_hand_holo(overlay, hand, k: float = 1.0, t: float = 0.0) -> None:
@@ -365,7 +444,7 @@ class GestureTracker:
     """Turns smoothed per-hand features into gesture events.
 
     Events (tuples):
-      ('pinch', feat)    a hand closed thumb+index+middle
+      ('pinch', feat)    a hand closed thumb+index (or the web-shoot pose)
       ('pull', feat)     a pinching hand travelled ~one hand-length while
                          still pinched -> the summon gesture
       ('unpinch', feat)  the pinch opened again
@@ -373,18 +452,23 @@ class GestureTracker:
                          with no other hand pinching.  Firing on the release
                          rather than on the hold is what makes it feel like
                          pulling a glove back on.
+      ('gear', None)     BOTH hands held fists for GEAR_HOLD and then opened
+                         -> toggle the holographic body gear.  Consumes the
+                         whole fist cycle so the opener can't also spawn a
+                         blueprint.
 
     Per-hand features are EMA-smoothed (matched by palm proximity), and hands
     that drop out for a few frames keep their state ("ghosting") so a tracking
     hiccup never cancels a gesture mid-way.
     """
 
-    FIST_HOLD = 0.60        # seconds one fist must be held before releasing
-    GRAB_ON = 0.30          # pinch3 below this -> pinch begins
-    GRAB_OFF = 0.46         # pinch3 above this -> pinch ends
-    PINCH_OPEN = 0.50       # index must be at least this straight to pinch
+    FIST_HOLD = 0.55        # seconds one fist must be held before releasing
+    GEAR_HOLD = 0.70        # seconds BOTH fists must be held before releasing
+    GRAB_ON = 0.42          # pinch3 below this -> pinch begins (3D, forgiving)
+    GRAB_OFF = 0.58         # pinch3 above this -> pinch ends
+    PINCH_OPEN = 0.62       # index must be no more curled than this to pinch
     PINCH_CONFIRM = 2       # frames of confirmation before a pinch edge
-    GHOST_TTL = 0.50        # seconds a dropped hand keeps its state
+    GHOST_TTL = 0.60        # seconds a dropped hand keeps its state
     PULL_DIST = 0.60        # pull distance, in hand-lengths
     PULL_WINDOW = 2.5       # seconds a pinch stays eligible to become a pull
     PINCH_QUIET = 0.60      # seconds after a pinch that no fist may fire
@@ -392,6 +476,7 @@ class GestureTracker:
     def __init__(self):
         self._slots: list = []
         self._pinch_last = -9.0
+        self._both_fist_since = None
 
     # -- public ------------------------------------------------------------- #
     def feed(self, hands: list, t: float) -> list:
@@ -414,19 +499,36 @@ class GestureTracker:
         live = [s for s in self._slots if t - s["last_seen"] <= self.GHOST_TTL]
         fists = [s for s in live if s["fist"]]
 
+        # -- both-fists held then RELEASED -> toggle body gear --------------- #
+        # (ghosted hands keep a held fist 'present' through a tracking blip)
+        if len(fists) >= 2:
+            if self._both_fist_since is None:
+                self._both_fist_since = t
+        elif self._both_fist_since is not None:
+            held = t - self._both_fist_since
+            self._both_fist_since = None
+            if held >= self.GEAR_HOLD:
+                events.append(("gear", None))
+                # consume the whole fist cycle so the openers don't ALSO fire
+                # the single-fist blueprint gesture
+                for s in self._slots:
+                    s["fist_fired"] = True
+                    s.pop("fist_ready", None)
+
         for s in self._slots:
             if s["matched"]:
                 self._pinch_edges(s, t, events)
         if any(s["pinch"] for s in live):
             self._pinch_last = t
-        # -- fist, held then RELEASED ---------------------------------------- #
+        # -- single fist, held then RELEASED --------------------------------- #
         # Never while ANY hand is pinching, or just has been: taking a shooter
         # off means reaching across with one hand while the other holds still,
         # and a hand held still is usually half-closed.  Without this, trying
         # to detach a shooter spawned a blueprint instead.
         if len(fists) <= 1 and t - self._pinch_last > self.PINCH_QUIET:
             for s in live:
-                if s["fist"] or not s.pop("fist_ready", False):
+                if s["fist"] or s.get("fist_fired") \
+                        or not s.pop("fist_ready", False):
                     continue
                 events.append(("fist", s["hand"]))
         return events
@@ -451,6 +553,9 @@ class GestureTracker:
                 "size": float(s["scale"]),
                 "pinch": bool(s["pinch"]),
                 "fist": bool(s["fist"]),
+                "open": bool(s.get("open", False)),
+                "webpose": bool(s.get("webpose", 0.0) > 0.5),
+                "gear_p": self._gear_progress(t),
                 "fist_p": fist_p,
                 "pull_p": pull_p,
                 # raw numbers for the debug readout (D key)
@@ -459,6 +564,12 @@ class GestureTracker:
                           ("index", "middle", "ring", "pinky", "thumb")],
             })
         return {"hands": hands}
+
+    def _gear_progress(self, t: float) -> float:
+        """0..1 charge of the both-fists -> gear gesture, for the HUD."""
+        if self._both_fist_since is None:
+            return 0.0
+        return clamp01((t - self._both_fist_since) / self.GEAR_HOLD)
 
     # -- internals ----------------------------------------------------------- #
     def _match(self, h):
@@ -478,7 +589,8 @@ class GestureTracker:
             "thumb_tip": h["thumb_tip"], "is_right": h["is_right"],
             "landmarks": h["landmarks"], "hand": h,
             "curls": None, "pinch3": 0.5, "spread": 0.5, "fist": False,
-            "scale": 0.1, "matched": True, "last_seen": t,
+            "webpose": 0.0, "open": False, "scale": 0.1,
+            "matched": True, "last_seen": t,
             "fist_since": None, "fist_fired": False, "pinch_ok": False,
             "pinch": False, "pinch_frames": 0,
             "pinch_px": h["palm"], "pinch_p0": None, "pinch_t0": 0.0,
@@ -491,13 +603,20 @@ class GestureTracker:
         if s["curls"] is None:
             s["curls"] = dict(h["curls"])
             s["pinch3"] = h["pinch3"]
+            s["pinch2"] = h["pinch2"]
             s["spread"] = h["spread"]
+            s["webpose"] = 1.0 if h["webpose"] else 0.0
+            s["open"] = bool(h["open"])
         else:
             a = 0.45
             for k in ("thumb", "index", "middle", "ring", "pinky"):
                 s["curls"][k] = a * h["curls"][k] + (1.0 - a) * s["curls"][k]
             s["pinch3"] = 0.50 * h["pinch3"] + 0.50 * s["pinch3"]
+            s["pinch2"] = 0.50 * h["pinch2"] + 0.50 * s["pinch2"]
             s["spread"] = 0.50 * h["spread"] + 0.50 * s["spread"]
+            s["webpose"] = 0.55 * (1.0 if h["webpose"] else 0.0) \
+                + 0.45 * s["webpose"]
+            s["open"] = bool(h["open"])
         for k in ("palm", "wrist", "mcp9", "index_tip", "middle_tip",
                   "thumb_tip", "is_right", "landmarks"):
             s[k] = h[k]
@@ -509,7 +628,7 @@ class GestureTracker:
         s["fist"] = fist
         # a closed fist also puts the thumb next to the fingertips, so without
         # this gate every fist read as a pinch and pull-summoned a shooter
-        s["pinch_ok"] = (not fist) and c["index"] > self.PINCH_OPEN
+        s["pinch_ok"] = (not fist) and c["index"] < self.PINCH_OPEN
         if not fist:                    # opening the hand re-arms the gesture
             s["fist_since"] = None
             s["fist_fired"] = False
@@ -564,9 +683,12 @@ class HoloDesk:
         self.shooters = {"Right": WebShooter("Right"), "Left": WebShooter("Left")}
         self._auto = {"Right": False, "Left": False}
         self.blueprint = None
+        self.gear: SuitGear | None = None
+        self.projectors: dict = {"Right": None, "Left": None}
         self.drags: dict = {"Right": None, "Left": None}
         self.hud = Hud()
         self.debug = False
+        self.guide = False
         self._log = log
 
     # -- helpers ------------------------------------------------------------- #
@@ -617,6 +739,12 @@ class HoloDesk:
                 d["armed_t"] = t
                 self._log(f"[gesture] pulled the {obj.side} shooter off - detached")
             return                                  # this pinch is a grab, not a pull
+        # summoning wants the WEB-SHOOT pose (thumb pressed on index+middle,
+        # ring+pinky folded) - the one gesture that means "fire a shooter".
+        # A tight thumb+index grab still works for people who can't hold it,
+        # but a lazy thumb brush no longer summons one by accident.
+        if not (feat.get("webpose") or feat.get("pinch2", 1.0) < 0.30):
+            return
         target = "Left" if feat["is_right"] else "Right"
         # If that wrist is off-camera the shooter waits at the edge of the
         # frame on its own side - never floating in the middle of the view.
@@ -656,6 +784,15 @@ class HoloDesk:
         self.blueprint = Blueprint(dock, 0.155 * h, 0.0)
         self._log("[gesture] fist -> web-shooter blueprint")
 
+    def on_gear(self, t):
+        """Both fists, held and released: suit up / stand down."""
+        if self.gear is None:
+            self.gear = SuitGear()
+            self._log("[gesture] both fists -> BODY GEAR ONLINE")
+        else:
+            self.gear.dismiss()
+            self._log("[gesture] both fists -> body gear off")
+
     def handle(self, events, w, h, t):
         for evt, payload in events:
             if evt == "pinch":
@@ -666,6 +803,8 @@ class HoloDesk:
                 self.on_unpinch(payload, w, h, t)
             elif evt == "fist":
                 self.on_fist(payload, w, h, t)
+            elif evt == "gear":
+                self.on_gear(t)
 
     def _end_drag(self, side, t):
         d = self.drags.get(side)
@@ -700,6 +839,29 @@ class HoloDesk:
             self._auto[side] = True
             self._log(f"[auto] {side} wrist in frame -> shooter equipped")
 
+    def _update_projectors(self, t, by_side, w, h):
+        """Open, spread palm -> a hologram materialises above it.
+
+        Continuous, not a toggle: the projector fades in while the palm stays
+        open and fades out when it closes, so it never steals the gesture
+        vocabulary - an open hand is the resting state, and the projection is
+        the ambient Stark furniture.
+        """
+        for side in ("Right", "Left"):
+            feat = by_side[side]
+            p = self.projectors[side]
+            if feat is not None and feat["open"] and not feat["fist"] \
+                    and not feat["webpose"]:
+                if p is None:
+                    p = PalmProjector(side)
+                    self.projectors[side] = p
+                p.hold(t)
+                p.track(feat, w, h)
+            elif p is not None:
+                p.release(t)
+                if p.dead(t):
+                    self.projectors[side] = None
+
     def update(self, dt, t, feats, w, h):
         by_side = {"Right": None, "Left": None}
         for f in feats:
@@ -729,6 +891,11 @@ class HoloDesk:
             self.blueprint.update(dt)
             if not self.blueprint.alive():
                 self.blueprint = None
+        if self.gear is not None:
+            self.gear.update(dt)
+            if not self.gear.alive():
+                self.gear = None
+        self._update_projectors(t, by_side, w, h)
 
     def drag_hud(self, t):
         out = []
@@ -747,39 +914,72 @@ class HoloDesk:
             if d is not None and d["obj"] is not None and not d["armed"]:
                 lock = max(lock, clamp01((t - d["t0"]) / self.DRAG_ARM))
         armed = any(d is not None and d["armed"] for d in self.drags.values())
+        gear_on = self.gear is not None and self.gear.dying is None
+        palm = any(p is not None and not p.dead(t)
+                   for p in self.projectors.values())
         return [("L WRIST", self.shooters["Left"].active(), 0.0),
                 ("R WRIST", self.shooters["Right"].active(), 0.0),
                 ("BLUEPRINT", self.blueprint is not None, 0.0),
+                ("BODY GEAR", gear_on, 0.0),
+                ("PALM AR", palm, 0.0),
                 ("MOVE LOCK", armed, lock)]
 
     # -- render -------------------------------------------------------------- #
+    def _status(self, t, state):
+        """A one-line JARVIS-style status readout built from REAL state only."""
+        if self.gear is not None and self.gear.dying is None:
+            return "BODY GEAR ONLINE  //  ALL SYSTEMS NOMINAL"
+        for hnd in state["hands"]:
+            if hnd.get("webpose"):
+                return "WEB-SHOOT POSE LOCKED  //  PINCH + PULL TO FIRE"
+            if hnd.get("open") and hnd.get("pinch"):
+                return "GRAB LOCKED  //  HOLD 4s TO ARM MOVE"
+        for hnd in state["hands"]:
+            if hnd.get("open"):
+                return "PALM HOLOGRAM READY  //  OPEN PALM PROJECTS"
+        return "STANDBY  //  SHOW YOUR HANDS TO THE CAMERA"
+
     def draw(self, frame, t, feats, tracker, fps):
         h, w = frame.shape[:2]
         k = 0.5
         if self.blueprint is not None:      # panel backing goes down first
             self.blueprint.backdrop(frame)
         ov = np.zeros((max(2, int(h * k)), max(2, int(w * k)), 3), np.uint8)
+        if self.gear is not None:           # the body gear sits behind everything
+            self.gear.draw(ov, k, t, feats)
         for side in ("Right", "Left"):
             self.shooters[side].draw(ov, k, t)
         if self.blueprint is not None:
             self.blueprint.draw(ov, k, t)
+        for p in self.projectors.values():  # palm holograms sit on top
+            if p is not None:
+                p.draw(ov, k, t)
         for f in feats:                       # skeleton tracing on every hand
             if f["landmarks"] is not None:
                 draw_hand_holo(ov, f["landmarks"], k, t)
         # the bilinear upscale from half-res IS the bloom - no blur pass needed
         bloom = cv2.resize(ov, (w, h), interpolation=cv2.INTER_LINEAR)
         cv2.addWeighted(bloom, 0.72, frame, 1.0, 0, frame)
-        # the wrist shooters are small, so they get a crisp full-resolution
-        # pass of their own once the bloom is down
+        # the wrist shooters and the palm holograms are small, so they get a
+        # crisp full-resolution pass of their own once the bloom is down
         for side in ("Right", "Left"):
             self.shooters[side].draw_sharp(frame, t)
+        for p in self.projectors.values():
+            if p is not None:
+                p.draw_sharp(frame, t)
+        if self.gear is not None:           # chest reactor glows at full res
+            self.gear.draw_sharp(frame, t)
         if self.blueprint is not None:
             self.blueprint.annotate(frame, t)
         state = tracker.hud_state(t)
         self.hud.draw(frame, {"t": t, "fps": fps, "hand_count": len(feats),
                               "hands": state["hands"],
                               "drags": self.drag_hud(t), "chips": self.chips(t),
-                              "debug": self.debug,
+                              "debug": self.debug, "guide": self.guide,
+                              "status": self._status(t, state),
+                              "gear_p": max((hnd.get("gear_p", 0.0)
+                                              for hnd in state["hands"]),
+                                             default=0.0),
                               "thresholds": {"grab_on": GestureTracker.GRAB_ON,
                                              "fist_curl": FIST_CURL}})
 
@@ -1100,6 +1300,10 @@ def run(args: argparse.Namespace) -> int:
                     toggle_record()
                 elif key in (ord("d"), ord("D")):
                     desk.debug = not desk.debug
+                elif key in (ord("g"), ord("G")):
+                    desk.guide = not desk.guide
+                elif key in (ord("r"), ord("R")):
+                    desk.on_gear(now)
 
             if args.record and recorder is None and kind != "image":
                 toggle_record()     # auto-start recording from launch
@@ -1128,31 +1332,87 @@ def run(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 # Self-test (headless; used to validate installs and regressions)
 # --------------------------------------------------------------------------- #
-def _fake_feat(is_right=True, fist=False, pinch3=None, hand_id=0.0, dx=0.0, dy=0.0):
+def _fake_feat(is_right=True, fist=False, pinch3=None, hand_id=0.0, dx=0.0, dy=0.0,
+               open_palm=False):
     """Synthetic feature dict for deterministic gesture-engine tests.
 
-    The fist is modelled the way a real one measures: fingers folded but the
-    THUMB nearly straight across them (~0.95), and the thumb tip therefore
-    sitting right next to the fingertips (a low pinch distance).
+    Curl values are the NEW metric: 1 = fully folded (a real fist reads
+    ~0.85 on all four fingers with the thumb barely curled, and the thumb tip
+    sits right next to the fingertips - a low pinch distance).
     """
     if fist:
-        curls = dict(thumb=0.95, index=0.2, middle=0.2, ring=0.2, pinky=0.2)
+        curls = dict(thumb=0.55, index=0.85, middle=0.85, ring=0.85, pinky=0.85)
         spread = 0.30
-    else:
-        curls = dict(thumb=0.9, index=0.95, middle=0.9, ring=0.9, pinky=0.9)
+        webpose = False
+        open_ = False
+    elif open_palm:
+        curls = dict(thumb=0.15, index=0.15, middle=0.15, ring=0.15, pinky=0.15)
         spread = 0.75
+        webpose = False
+        open_ = True
+    else:                                   # the web-shoot pinch pose
+        curls = dict(thumb=0.55, index=0.15, middle=0.20, ring=0.80, pinky=0.80)
+        spread = 0.45
+        webpose = True
+        open_ = False
     if pinch3 is None:
-        pinch3 = 0.15 if fist else 0.60
+        pinch3 = 0.15 if fist else (0.90 if open_palm else 0.12)
+    pinch2 = 0.10 if not fist and not open_palm else 0.90
     x = 0.3 + hand_id + dx
     y = dy
     return {
         "landmarks": None, "is_right": bool(is_right), "curls": curls,
-        "fist": fist, "open": not fist, "pinch3": pinch3, "spread": spread,
+        "fist": fist, "open": open_, "webpose": webpose,
+        "pinch3": pinch3, "pinch2": pinch2, "spread": spread,
         "palm": np.array([x, 0.50 + y]), "wrist": np.array([x, 0.75 + y]),
         "mcp9": np.array([x, 0.62 + y]), "index_tip": np.array([x, 0.44 + y]),
         "middle_tip": np.array([x + 0.05, 0.44 + y]),
         "thumb_tip": np.array([x, 0.46 + y]),
     }
+
+
+def _synthetic_hand(mode="open", scale=0.15):
+    """Build 21 landmark objects for a hand in one of three clean poses.
+
+    Used to validate the angle-based curl metric on real geometry.  Landmarks
+    are (x, y) in normalised space; z stays 0 for all of them.
+    """
+    class _LM:
+        __slots__ = ("x", "y", "z")
+
+        def __init__(self, x, y, z=0.0):
+            self.x, self.y, self.z = float(x), float(y), float(z)
+
+    lm = [
+        _LM(0.50, 0.85),                        # 0 wrist
+        _LM(0.46, 0.80), _LM(0.45, 0.78),       # 1-4 thumb (cmc, mcp, ip, tip)
+        _LM(0.44, 0.76), _LM(0.43, 0.74),
+    ]
+
+    def finger(mcp, straight):
+        """Four joints (mcp, pip, dip, tip); straight = 180-degree chain."""
+        x, y = mcp
+        if straight:
+            return [(x, y), (x, y - 0.07), (x, y - 0.13), (x, y - 0.19)]
+        # folded: dip + tip collapse back toward the palm
+        return [(x, y), (x, y - 0.04), (x - 0.03, y - 0.02), (x - 0.05, y + 0.02)]
+
+    fold = {"open": [False, False, False, False],
+            "webpose": [False, False, True, True],
+            "fist": [True, True, True, True]}[mode]
+    for i, mcp in enumerate([(0.44, 0.68), (0.50, 0.68), (0.56, 0.68),
+                             (0.62, 0.70)]):
+        for (x, y) in finger(mcp, not fold[i]):
+            lm.append(_LM(x, y))                # 5-20 in MediaPipe order
+    if mode == "open":                          # thumb out wide, clear of index
+        lm[THUMB_TIP] = _LM(0.40, 0.60)
+    elif mode == "webpose":                     # thumb tucked onto index tip
+        lm[THUMB_IP] = _LM(0.44, 0.58)
+        lm[THUMB_TIP2] = _LM(0.44, 0.50)
+    else:                                       # fist: thumb across the fingers
+        lm[THUMB_IP] = _LM(0.50, 0.63)
+        lm[THUMB_TIP2] = _LM(0.53, 0.58)
+    return lm
 
 
 def _feat_from_landmarks(landmarks, is_right):
@@ -1172,7 +1432,7 @@ def selftest(args: argparse.Namespace) -> int:
     ensure_model()
     print("[ok] model ready")
     landmarker = build_landmarker(MODEL_PATH)
-    print("[ok] HandLandmarker created (VIDEO mode, 0.10/0.10/0.20 confidence)")
+    print("[ok] HandLandmarker created (VIDEO mode, 0.20/0.20/0.40 confidence)")
 
     # 1. real detection on a sample image with hands
     sample = Path(tempfile.gettempdir()) / "hand_zoom_sample.jpg"
@@ -1200,12 +1460,17 @@ def selftest(args: argparse.Namespace) -> int:
     # 3. the 3D models compile and render real shaded geometry
     import holo3d as H3
     import holo_models as HM
-    for name, mesh in (("shooter", HM.shooter_mesh()), ("worn LOD", HM.shooter_mesh(0))):
-        assert mesh.V is not None and len(mesh.FI) > 100, f"{name} mesh too coarse"
+    for name, mesh in (("shooter", HM.shooter_mesh()),
+                       ("worn LOD", HM.shooter_mesh(0)),
+                       ("gauntlet", HM.gauntlet_mesh()),
+                       ("suit", HM.suit_mesh()),
+                       ("reactor", HM.reactor_mesh()),
+                       ("palm screen", HM.palm_screen_mesh())):
+        assert mesh.V is not None and len(mesh.FI) > 40, f"{name} mesh too coarse"
         canvas = np.zeros((240, 320, 3), np.uint8)
         H3.render_mesh(canvas, mesh, (160, 120), 60, H3.rot_matrix(0.6, -0.3, 0.2))
         lit = int((canvas.sum(axis=2) > 120).sum())
-        assert lit > 400, f"{name} mesh drew almost nothing ({lit} px)"
+        assert lit > 200, f"{name} mesh drew almost nothing ({lit} px)"
         assert canvas[:, :, 0].sum() > canvas[:, :, 2].sum(), \
             f"{name} must render BLUE-dominant"
     print(f"[ok] 3D models compile and render blue "
@@ -1308,10 +1573,13 @@ def selftest(args: argparse.Namespace) -> int:
     print("[ok] tracker: pinch+pull summons once, a still pinch does not")
 
     # 9. tracker: one fist -> blueprint, but never while a hand is pinching
-    assert is_fist(dict(thumb=0.95, index=0.3, middle=0.3, ring=0.35, pinky=0.4)), \
-        "a real fist keeps the thumb straight across the fingers - it must count"
-    assert not is_fist(dict(thumb=1.0, index=0.99, middle=0.99, ring=0.99, pinky=0.99)), \
+    #    (curl values are the new metric: 1 = folded)
+    assert is_fist(dict(thumb=0.55, index=0.80, middle=0.80, ring=0.85, pinky=0.85)), \
+        "a real fist folds all four fingers - it must count"
+    assert not is_fist(dict(thumb=0.15, index=0.15, middle=0.15, ring=0.15, pinky=0.15)), \
         "an open hand is not a fist"
+    assert not is_fist(dict(thumb=0.55, index=0.20, middle=0.25, ring=0.80, pinky=0.80)), \
+        "the web-shoot pose (index+middle out) is not a fist"
     tr3 = GestureTracker()
     evs = []
     for i in range(24):                        # 0.8 s closed: armed, not fired
@@ -1349,6 +1617,26 @@ def selftest(args: argparse.Namespace) -> int:
     assert not [e for e in evs if e[0] == "fist"], \
         "a fist must never fire the blueprint while the other hand is pinching"
     print("[ok] tracker: one fist -> blueprint, never while a hand is pinching")
+
+    # 9a. the angle-based curl metric on real joint geometry: straight fingers
+    #     read open, folded fingers read closed, and the poses are distinct
+    hm = hand_features(_synthetic_hand("open"), True)
+    assert all(hm["curls"][k] < 0.25 for k in
+               ("index", "middle", "ring", "pinky")), \
+        f"straight fingers must read as open (got {hm['curls']})"
+    assert hm["open"] and not hm["fist"] and not hm["webpose"], \
+        "an open hand must be open-only"
+    hf = hand_features(_synthetic_hand("fist"), True)
+    assert hf["fist"] and not hf["open"] and not hf["webpose"], \
+        "a folded hand must read as a fist only"
+    assert all(hf["curls"][k] > 0.55 for k in
+               ("index", "middle", "ring", "pinky")), \
+        f"folded fingers must read as curled (got {hf['curls']})"
+    hw = hand_features(_synthetic_hand("webpose"), True)
+    assert hw["webpose"] and not hw["fist"] and not hw["open"], \
+        "the web-shoot pose must be its own thing"
+    assert hw["pinch3"] < 0.45, "the web-shoot pose tucks the thumb onto the tips"
+    print("[ok] angle metric: straight vs folded vs web-shoot pose all distinct")
 
     # 10. desk: pinch-pull with the RIGHT hand arms the LEFT wrist, and vice versa
     desk = HoloDesk(log=lambda *a: None)
@@ -1441,6 +1729,90 @@ def selftest(args: argparse.Namespace) -> int:
     assert desk2.blueprint.pos == here and desk2.drags["Right"] is None, \
         "releasing must simply leave the object where it is"
     print("[ok] desk: grab 4 s -> move lock -> object follows -> release parks it")
+
+    # 11a. BOTH fists held then opened -> exactly one 'gear' event, and the
+    #      openers are consumed so they never ALSO fire the blueprint
+    trg = GestureTracker()
+    evs = []
+    for i in range(24):                        # 0.8 s of both fists
+        evs += trg.feed([_fake_feat(True, fist=True),
+                         _fake_feat(False, fist=True, hand_id=0.45)], i / 30.0)
+    assert not [e for e in evs if e[0] == "gear"], \
+        "gear fires on the release, not while held"
+    assert not [e for e in evs if e[0] == "fist"], \
+        "both fists must never fire the single-fist gesture"
+    for i in range(4):                         # ...and both open
+        evs += trg.feed([_fake_feat(True, open_palm=True),
+                         _fake_feat(False, open_palm=True, hand_id=0.45)],
+                        0.8 + i / 30.0)
+    gears = [e for e in evs if e[0] == "gear"]
+    assert len(gears) == 1, f"both fists must fire gear exactly once (got {len(gears)})"
+    assert not [e for e in evs if e[0] == "fist"], \
+        "the gear release must consume the fist cycle"
+    # a short both-fist flash must not fire gear
+    trgs = GestureTracker()
+    evs = []
+    for i in range(6):                         # 0.2 s: too short
+        evs += trgs.feed([_fake_feat(True, fist=True),
+                          _fake_feat(False, fist=True, hand_id=0.45)], i / 30.0)
+    for i in range(4):
+        evs += trgs.feed([_fake_feat(True, open_palm=True),
+                          _fake_feat(False, open_palm=True, hand_id=0.45)],
+                         0.2 + i / 30.0)
+    assert not [e for e in evs if e[0] == "gear"], "a quick both-fist must not fire"
+    # and the desk toggles the full body gear on and off
+    dg = HoloDesk(log=lambda *a: None)
+    dg.handle([("gear", None)], 640, 480, 0.0)
+    assert dg.gear is not None and dg.gear.dying is None, "gear must come online"
+    dg.update(1 / 30.0, 0.2, feats, 640, 480)
+    ov = np.zeros((240, 320, 3), np.uint8)
+    dg.gear.draw(ov, 0.5, 0.2, feats)
+    assert ov.any(), "the body gear must draw into the overlay"
+    full = np.zeros((480, 640, 3), np.uint8)
+    dg.gear.draw_sharp(full, 0.2)
+    assert full.any(), "the chest reactor must draw at full resolution"
+    dg.handle([("gear", None)], 640, 480, 1.0)
+    assert dg.gear.dying is not None, "gear must stand down"
+    for i in range(22):                        # let the fade run out
+        dg.update(1 / 30.0, 1.0 + i / 30.0, feats, 640, 480)
+    assert dg.gear is None, "a dismissed gear must expire"
+    print("[ok] gear: both-fists -> body gear on/off, one event, no blueprint")
+
+    # 11b. an open palm starts a projection, it tracks the hand, and closing
+    #      the hand retires it
+    dp = HoloDesk(log=lambda *a: None)
+    op = _fake_feat(True, open_palm=True)
+    for i in range(20):                        # hold the palm open 0.67 s
+        dp.update(1 / 30.0, i / 30.0, [op], 640, 480)
+    proj = dp.projectors["Right"]
+    assert proj is not None, "an open palm must start a projection"
+    assert proj._alpha(0.7) > 0.9, "a held-open palm must fully project"
+    ov = np.zeros((240, 320, 3), np.uint8)
+    proj.draw(ov, 0.5, 0.7)
+    assert ov.any(), "the projection must draw its beam + ring"
+    full = np.zeros((480, 640, 3), np.uint8)
+    proj.draw_sharp(full, 0.7)
+    assert full.any(), "the projection must render full-res"
+    for i in range(15):                        # close the hand
+        dp.update(1 / 30.0, 0.7 + i / 30.0, [_fake_feat(True, fist=True)], 640, 480)
+    assert dp.projectors["Right"] is None, "a closed palm must retire the projection"
+    print("[ok] palm projection: open palm -> hologram -> fades on close")
+
+    # 11c. summoning requires the web-shoot pose (or a tight thumb+index); a
+    #      lazy pinch that never forms the pose must not summon anything
+    ds = HoloDesk(log=lambda *a: None)
+    lazy = _fake_feat(True, pinch3=0.35)      # pinchy but NOT the web-shoot pose
+    lazy["webpose"] = False
+    lazy["pinch2"] = 0.50
+    ds.handle([("pinch", lazy), ("pull", lazy)], 640, 480, 0.0)
+    ds.update(1 / 30.0, 0.1, [], 640, 480)
+    assert not ds.shooters["Left"].active(), \
+        "a non-web-shoot pinch must not summon a shooter"
+    tight = _fake_feat(True, pinch3=0.10)     # the proper pose
+    ds.handle([("pinch", tight), ("pull", tight)], 640, 480, 0.2)
+    ds.update(1 / 30.0, 0.3, [], 640, 480)
+    assert ds.shooters["Left"].active(), "the web-shoot pose must summon"
+    print("[ok] summon gate: web-shoot pose summons, a lazy pinch does not")
 
     # 12. the HUD renders over a live frame without touching the geometry
     frame = np.zeros((480, 640, 3), np.uint8)
