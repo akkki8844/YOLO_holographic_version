@@ -5,53 +5,63 @@ Tony-Stark-style hard-light holograms, controlled entirely by hand gestures and
 rendered as real shaded 3D geometry (see holo3d.py / holo_models.py).  Electric
 blue only - no other hue is ever produced.
 
-Gestures
---------
-  PINCH (thumb+index+middle) and PULL ......... summon a 3D web-shooter onto
-                                               the OPPOSITE wrist: pinch-pull
-                                               with the RIGHT hand and it flies
-                                               onto the LEFT wrist, and vice
-                                               versa.  Pinch-pull again to send
-                                               that shooter away.
-  PINCH A WORN SHOOTER and PULL ............... take it off.  Reach over,
-                                               pinch the shooter sitting on
-                                               your wrist and pull, exactly as
-                                               you would strip a real one off:
-                                               it detaches on the spot, becomes
-                                               its own object in your hand and
-                                               stays wherever you drop it.
-  ONE FIST, hold ~0.45 s ...................... a detailed exploded 3D
-                                               BLUEPRINT of the web-shooter in
-                                               black and white, docked opposite
-                                               the fist, with callouts and
-                                               dimensions.  It holds still so
-                                               it can be read.  Same gesture
-                                               again dismisses it.
-  GRAB an object and HOLD 4 s ................. a lock ring charges around it;
-                                               when it snaps READY the object
-                                               follows your hand.  Let go and it
-                                               simply stays where you left it.
-  BOTH FISTS, hold ~0.7 s, then open ......... toggle the full BODY GEAR: torso
-                                               shell with spider emblem and
-                                               webbing, shoulders, belt, an
-                                               armoured gauntlet + arc reactor
-                                               on every wrist, and the chest
-                                               reactor.  Same gesture (or R)
-                                               stands it down.
-  OPEN PALM, hold it ......................... a hologram materialises above
-                                               the palm and tracks it - the
-                                               Stark palm-projection.
-  WEB-SHOOT POSE held ........................ a targeting web-line snaps out
-                                               of the worn shooter's nozzle.
-  G ........................................... toggle the on-screen gesture
+Gestures (final set - each one is gated so it can never fire another by
+accident; see GestureTracker / HoloDesk for the exact collision guards)
+--------------------------------------------------------------------------
+  (automatic) SHOW A WRIST .................... a forearm bracer equips onto
+                                               it the instant it's seen - no
+                                               gesture needed.  Hard cap of
+                                               TWO on screen at once (one per
+                                               wrist); the blueprint doesn't
+                                               count against the cap.
+  WEB-SHOOT POSE (index+middle out, thumb
+    pinched to them, ring+pinky folded)
+    then PULL ................................ sends that wrist's bracer away
+                                               (pinch-pull again brings it
+                                               back).  A tight thumb+index
+                                               grab also works.
+  PINCH A WORN BRACER and PULL ................ take it off by hand, the way
+                                               you'd strip a real one off: it
+                                               detaches on the spot, becomes
+                                               its own free object, and stays
+                                               wherever you let it go.
+  ONE FIST, hold ~0.55 s, then OPEN ........... if that wrist's bracer is off,
+                                               this wears it back on.  If it's
+                                               already on, the SAME gesture
+                                               instead raises an exploded 3D
+                                               BLUEPRINT - a monochrome sidebar
+                                               panel with callouts, a
+                                               dimension line and a spec block.
+                                               Fires on release, so a fist held
+                                               for the other gesture's sake
+                                               never triggers this one early.
+  BOTH FISTS, hold ~0.7 s, then OPEN .......... toggle the full BODY GEAR:
+                                               torso shell + spider emblem +
+                                               webbing, shoulder plates, belt,
+                                               an armoured gauntlet with its
+                                               own arc reactor on every wrist,
+                                               and the chest reactor.  Same
+                                               gesture (or R) stands it down.
+  OPEN PALM, hold it ........................... a Stark hologram materialises
+                                               above the palm and tracks it;
+                                               it fades the moment the hand
+                                               closes.
+  WEB-SHOOT POSE held (bracer worn) ........... a targeting web-line snaps out
+                                               of the spinneret to a reticle.
+  GRAB an object and HOLD 4 s .................. a lock ring charges around
+                                               it; when it snaps READY the
+                                               object follows your hand.
+                                               Release and it stays exactly
+                                               where you left it.
+  G ............................................ toggle the on-screen gesture
                                                guide panel
-  D ........................................... live gesture readout (shows the
-                                               raw finger-curl / pinch numbers
-                                               so a stubborn gesture can be
-                                               seen, not guessed at)
-  V ........................................... start / stop recording
-  R ........................................... toggle body gear (keyboard)
-  Esc / Q ..................................... quit
+  D ............................................ live gesture readout (raw
+                                               finger-curl / pinch numbers, so
+                                               a stubborn gesture can be seen,
+                                               not guessed at)
+  V ............................................ start / stop recording
+  R ............................................ toggle body gear (keyboard)
+  Esc / Q ....................................... quit
 
 Video calls
 -----------
@@ -299,9 +309,12 @@ def curl_features(landmarks) -> dict:
 
 FIST_CURL = 0.55          # a finger more curled than this counts as folded
 FIST_MEAN = 0.62          # ...and the whole hand has to be closed on average
+FIST_CURL_OFF = 0.46      # exit thresholds are looser: closing takes a firm
+FIST_MEAN_OFF = 0.50      # squeeze, opening only needs a clear relax - no
+                          # single-frame flicker right on the boundary
 
 
-def is_fist(curls: dict) -> bool:
+def is_fist(curls: dict, was_fist: bool = False) -> bool:
     """True when the four fingers are folded into the palm.
 
     The THUMB is deliberately ignored.  In a natural fist it lies flat across
@@ -309,10 +322,17 @@ def is_fist(curls: dict) -> bool:
     the thumb out at ~0.1, so testing it would either reject every real fist
     or accept every relaxed hand.  One finger is allowed to disagree, since a
     single mis-placed landmark should not cancel the gesture.
+
+    Hysteresis: once a fist is registered, it takes a clear relax (not just a
+    wobble back across the same line) to release it - the same on/off split
+    already used for pinches, so a fist held near the boundary doesn't chatter
+    open/closed and re-fire the hold gesture.
     """
+    curl_t = FIST_CURL_OFF if was_fist else FIST_CURL
+    mean_t = FIST_MEAN_OFF if was_fist else FIST_MEAN
     vals = [curls["index"], curls["middle"], curls["ring"], curls["pinky"]]
-    folded = sum(1 for v in vals if v > FIST_CURL)
-    return folded >= 3 and (sum(vals) / 4.0) > FIST_MEAN
+    folded = sum(1 for v in vals if v > curl_t)
+    return folded >= 3 and (sum(vals) / 4.0) > mean_t
 
 
 def hand_features(landmarks, is_right: bool) -> dict:
@@ -624,7 +644,7 @@ class GestureTracker:
         s["scale"] = float(np.linalg.norm(h["mcp9"] - h["wrist"])) or 0.1
         s["pinch_px"] = 0.5 * (h["thumb_tip"] + h["index_tip"])
         c = s["curls"]
-        fist = is_fist(c)
+        fist = is_fist(c, was_fist=s["fist"])
         s["fist"] = fist
         # a closed fist also puts the thumb next to the fingertips, so without
         # this gate every fist read as a pinch and pull-summoned a shooter

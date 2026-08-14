@@ -8,15 +8,20 @@ injection. Every feature is triggered by a hand gesture.
 
 ## The gestures
 
+Every gesture is gated so it can never misfire into another one — see
+`GestureTracker` / `HoloDesk` in `hand_zoom.py` for the exact collision
+guards (pinch-quiet windows, fist-fired flags, hysteresis).
+
 | Gesture | What happens |
 |---|---|
-| **WEB-SHOOT POSE + PULL** (thumb pressed on index+middle, ring+pinky down) | The pinch grabs hard-light out of the air and a **3D web-shooter flies onto the OPPOSITE wrist** — with your **right** hand it lands on your **left** wrist, and vice versa. It arrives as a wireframe, solidifies on landing, then tracks that wrist in full shaded 3D. Pinch-pull again to send it away. (A tight thumb+index grab also works; a lazy thumb brush no longer summons one by accident.) |
-| **PINCH A WORN SHOOTER and PULL** | **Take it off.** Reach over, pinch the shooter sitting on your wrist and pull — the way you'd strip a real one off. It detaches immediately (no move-lock countdown), becomes its own object following your hand, and stays wherever you drop it. |
-| **ONE FIST, hold ~0.55 s, then open** | If that wrist isn't wearing its shooter, this **puts it back on** — like pulling a glove on. Once you ARE wearing it, the same gesture raises a **detailed exploded blueprint** in black-and-white drafting style: real 3D geometry holding a fixed three-quarter view (it does not spin — a spinning schematic can't be read), cycling assemble → hold → explode against a ghosted outline, with leader-line callouts for all nine parts, a dimension line and a live spec block. The same gesture dismisses it. |
+| **(automatic) show a wrist** | A **forearm bracer** — a 3D cuff that wraps from the forearm over the wrist onto the back of the hand — equips onto it the instant it's seen, no gesture needed. Hard cap of **two** on screen at once (one per wrist); the blueprint never counts against that cap. |
+| **WEB-SHOOT POSE + PULL** (thumb pressed on index+middle, ring+pinky down) | Sends that wrist's bracer away. Pinch-pull again to bring it back. (A tight thumb+index grab also works; a lazy thumb brush no longer triggers it by accident.) |
+| **PINCH A WORN BRACER and PULL** | **Take it off by hand.** Reach over, pinch the bracer sitting on your wrist and pull — the way you'd strip a real one off. It detaches immediately (no move-lock countdown), becomes its own object following your hand, and stays wherever you drop it. |
+| **ONE FIST, hold ~0.55 s, then open** | If that wrist's bracer is off, this **wears it back on** — closing and opening the hand like pulling a glove on. Once it IS on, the same gesture instead raises a **monochrome exploded blueprint** docked as a sidebar panel: real 3D geometry in a fixed view (it never spins — a spinning schematic can't be read), with leader-line callouts, a dimension line and a live spec block. It fires on **release**, so a fist held for any other purpose can never trigger it early; the same gesture dismisses the blueprint. |
 | **BOTH FISTS, hold ~0.7 s, then open** | Toggle the full **holographic body gear**: the torso shell with the spider emblem and webbing, shoulder plates, belt, an armoured gauntlet with its own arc reactor on every visible wrist, and the **chest reactor** burning over the sternum. The `R` key does the same. |
 | **OPEN PALM, hold it** | A **Stark palm-projection** materialises above the hand — a holographic screen with a rotating mini web-shooter playing on it — and tracks the palm in 3D. It fades out the moment the hand closes. |
-| **WEB-SHOOT POSE held** (wearing a shooter) | A dotted **targeting web-line** snaps out of the spinneret along the aim axis, ending in a reticle. |
-| **GRAB an object and HOLD 4 s** | A lock ring charges around whatever you grabbed (a shooter, the blueprint) with a ticking countdown. When it snaps **READY**, the object follows your hand. Release and it simply **stays where you left it** — nothing else happens. |
+| **WEB-SHOOT POSE held** (bracer worn) | A dotted **targeting web-line** snaps out of the spinneret along the aim axis, ending in a reticle. |
+| **GRAB an object and HOLD 4 s** | A lock ring charges around whatever you grabbed (a bracer, the blueprint) with a ticking countdown. When it snaps **READY**, the object follows your hand. Release and it simply **stays where you left it** — nothing else happens. |
 | `G` | Toggle the on-screen gesture guide panel. |
 | `D` | Live gesture readout — the raw finger-curl / pinch numbers, so a stubborn gesture can be seen, not guessed at. |
 | `V` | Start / stop recording the preview to `recordings/`. |
