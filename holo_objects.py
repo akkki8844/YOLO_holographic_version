@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""holo_objects.py - the hard-light objects: web-shooters, blueprint, suit.
+"""holo_objects.py - the hard-light objects: web-shooters, body gear, palm HUD.
 
 Every object draws into ONE shared half-resolution overlay per frame (the
 upscale doubles as the bloom), and may add crisp full-resolution annotations
@@ -18,8 +18,7 @@ import cv2
 import numpy as np
 
 import holo_models as MODELS
-from holo3d import (HOLO_BLUE, HOLO_CYAN, HOLO_DEEP, HOLO_DIM, HOLO_WHITE,
-                    FLIP_X, MONO_DIM, MONO_FILL, MONO_GREY, MONO_WHITE,
+from holo3d import (HOLO_BLUE, HOLO_CYAN, HOLO_DEEP, HOLO_WHITE, FLIP_X,
                     clamp01, dim, ease_out_back, project, render_glow,
                     render_mesh, rot_matrix, smoothstep)
 
@@ -89,13 +88,26 @@ class WebShooter:
             arrive    flying from the summoning pinch to this wrist
             seek      the wrist is not visible: parked, waiting to snap on
             on        mounted on the wrist, tracking the hand
-            held      grabbed (4 s lock) or just pulled off, following a pinch
+            peel      being physically pulled off the wrist right now - a
+                      short unclip-and-swing-free animation, not a teleport
+            held      grabbed (4 s lock) or just peeled off, following a pinch
             float     detached: its own object, parked where it was let go
             dismiss   spinning down and dissolving
     """
 
     ARRIVE = 0.70
+    PEEL = 0.22
     DISMISS = 0.45
+
+    # The strap physics.  A real shooter is STRAPPED to the arm, not welded to
+    # it: whip your wrist and the housing lags a few millimetres, then settles.
+    # Critical damping is the whole point - underdamped would wobble like jelly,
+    # which is a different and equally wrong kind of unreal.
+    MOUNT_W = 30.0                       # spring angular frequency, rad/s
+    # Peak kick works out at RECOIL/(MOUNT_W*e) px, so this is ~10 px of travel
+    # back along the forearm - readable against a ~70 px housing without
+    # looking like the thing came loose.
+    RECOIL = 850.0                       # px/s impulse when a web fires
 
     def __init__(self, side: str):
         self.side = side
@@ -112,6 +124,12 @@ class WebShooter:
         self._drag_off = (0.0, 0.0)
         self._fr = None
         self._webpose = False
+        self._webpose_since = None
+        self._peel_from = None
+        self._peel_to = None
+        self._vel = (0.0, 0.0)       # mount-spring velocity, px/s
+        self._prev = None            # last frame's position, for swing
+        self._swing = 0.0            # trailing roll of a dangling shooter
 
     # -- lifecycle ---------------------------------------------------------- #
     def active(self) -> bool:
@@ -155,21 +173,23 @@ class WebShooter:
         """Peel the shooter off the wrist - the real 'take it off' gesture.
 
         Reaching over, pinching the shooter on the other wrist and pulling is
-        exactly how you take one off in real life, so it comes straight off:
-        no 4-second move lock, no dismissal.  It becomes its own free object,
-        follows the pinch, and stays wherever it is let go.
+        exactly how you take one off in real life, so it starts coming off
+        immediately: no 4-second move lock, no dismissal.  It doesn't teleport
+        into your grip though - it unclips and swings free over PEEL seconds
+        (a short pop away from the wrist along the forearm, then a swing into
+        the pinch), which is what actually reads as being taken off rather
+        than being replaced by a different object.  Once the animation lands
+        it becomes its own free object, follows the pinch, and stays wherever
+        it is let go.
         """
         if self.state not in ("on", "seek"):
             return False
-        self.state = "held"
-        self._lock = t
+        self.state = "peel"
+        self.t0 = t
         self._flash = t
         self.scale = max(self.scale, 40.0)
-        if self.pos is not None:
-            self._drag_off = (self.pos[0] - px[0], self.pos[1] - px[1])
-        else:
-            self.pos = (float(px[0]), float(px[1]))
-            self._drag_off = (0.0, 0.0)
+        self._peel_from = self.pos if self.pos is not None else (float(px[0]), float(px[1]))
+        self._peel_to = (float(px[0]), float(px[1]))
         return True
 
     # -- drag protocol ------------------------------------------------------ #
@@ -198,13 +218,56 @@ class WebShooter:
             self._park = self.pos
 
     # -- per-frame ---------------------------------------------------------- #
+    def _settle(self, target, dt: float):
+        """Chase the wrist anchor through a stiff critically-damped spring.
+
+        Snapping the model onto the anchor every frame is what made it read as
+        a decal painted onto the video: nothing in the real world tracks your
+        arm with zero lag.  A stiff spring costs about a sixth of a second of
+        settle and buys the single strongest cue that the thing is a physical
+        object riding your arm rather than a sprite pinned to a landmark.
+        """
+        if self.pos is None:
+            self._vel = (0.0, 0.0)
+            return (float(target[0]), float(target[1]))
+        # The EXACT solution of a critically-damped spring over dt, not a
+        # stepped approximation.  A strap stiff enough to feel like a strap has
+        # C*dt > 1 at 30 fps, and explicit integration of that flips the
+        # velocity's sign every frame - the model shakes itself apart instead of
+        # settling.  The closed form is unconditionally stable at any framerate
+        # and never overshoots, so the same feel survives a frame-rate drop.
+        dt = max(1e-4, min(dt, 0.1))
+        w = self.MOUNT_W
+        e = math.exp(-w * dt)
+        pos, vel = [0.0, 0.0], [0.0, 0.0]
+        for i in (0, 1):
+            x = self.pos[i] - target[i]          # displacement from the anchor
+            k = (self._vel[i] + w * x) * dt
+            pos[i] = target[i] + (x + k) * e
+            vel[i] = (self._vel[i] - w * k) * e
+        self._vel = (vel[0], vel[1])
+        return (pos[0], pos[1])
+
     def update(self, dt: float, t: float, feat, w: int, h: int) -> None:
         fr = hand_frame(feat, w, h)
         self._fr = fr
-        self._webpose = bool(feat is not None and feat.get("webpose", False))
+        wp = bool(feat is not None and feat.get("webpose", False))
+        if wp and not self._webpose:
+            self._webpose_since = t
+            # A web firing kicks the housing back along the forearm.  The
+            # impulse goes straight INTO the mount spring rather than playing a
+            # canned bounce animation, so the kick and the settle afterwards
+            # are the same physics that already holds it on the arm - which is
+            # why it lands like recoil instead of like a wobble effect.
+            if self.state == "on" and fr is not None:
+                self._vel = (self._vel[0] - fr["ax"][0] * self.RECOIL,
+                             self._vel[1] - fr["ax"][1] * self.RECOIL)
+        elif not wp:
+            self._webpose_since = None
+        self._webpose = wp
         self.spin += dt
         if fr is not None:
-            # the model origin is the wrist itself: the bracer runs back up the
+            # the model origin is the wrist itself: the shooter housing runs back up the
             # forearm from here and only the spinneret crosses onto the hand
             anchor = (fr["W"][0] + fr["ax"][0] * 0.04 * fr["L"],
                       fr["W"][1] + fr["ax"][1] * 0.04 * fr["L"])
@@ -238,13 +301,45 @@ class WebShooter:
         elif self.state == "on":
             if fr is None:
                 self.pos = None                   # hand gone: hide, stay mounted
+                self._vel = (0.0, 0.0)
             else:
-                self.pos = anchor
+                # strapped on, not welded: it trails the wrist by a hair and
+                # settles, and a fired web kicks it back through the same spring
+                self.pos = self._settle(anchor, dt)
                 self.scale = live_scale
                 self.rot = _mount_rot(fr, wobble=0.05 * math.sin(t * 1.6))
+        elif self.state == "peel":
+            f = clamp01((t - self.t0) / self.PEEL)
+            e = smoothstep(f)
+            # the axis to pop away along: whatever forearm direction we last
+            # saw, so the shooter unclips straight back off the wrist instead
+            # of sliding sideways through it
+            ax = fr["ax"] if fr is not None else (self._fr["ax"] if self._fr
+                                                   is not None else (0.0, -1.0))
+            base_scale = live_scale if live_scale else max(self.scale, 42.0)
+            bulge = math.sin(math.pi * f) * 0.60 * base_scale
+            bx = self._peel_from[0] + (self._peel_to[0] - self._peel_from[0]) * e
+            by = self._peel_from[1] + (self._peel_to[1] - self._peel_from[1]) * e
+            self.pos = (bx - ax[0] * bulge, by - ax[1] * bulge)
+            self.rot = rot_matrix(0.45 + self.spin * 0.8, -0.30, (1.0 - e) * 1.15)
+            self.scale = base_scale * (1.0 + 0.18 * math.sin(math.pi * f))
+            if f >= 1.0:
+                self.state = "held"
+                self._lock = t
+                self.pos = self._peel_to
+                self._drag_off = (0.0, 0.0)
         elif self.state == "held":
+            # A held object SWINGS.  Carry it left and it trails right, the way
+            # anything dangling from your fingers does, and it settles when you
+            # stop.  The roll comes from the pinch's REAL lateral speed rather
+            # than a loop, so the motion is the one you actually made.
+            vx = 0.0
+            if self.pos is not None and self._prev is not None and dt > 1e-4:
+                vx = (self.pos[0] - self._prev[0]) / dt
+            want = math.copysign(0.85, vx) * clamp01(abs(vx) / 900.0)
+            self._swing += (want - self._swing) * min(1.0, dt * 7.0)
             self.rot = rot_matrix(0.45 + self.spin * 0.5, -0.30,
-                                  0.20 * math.sin(t * 1.1))
+                                  0.20 * math.sin(t * 1.1) + self._swing)
             self.scale = max(self.scale, 44.0)
         elif self.state == "float":
             if self._park is not None:
@@ -258,6 +353,7 @@ class WebShooter:
             if f >= 1.0:
                 self.state = "off"
                 self.pos = None
+        self._prev = self.pos
 
     # -- render ------------------------------------------------------------- #
     def _shading(self, t: float):
@@ -301,12 +397,34 @@ class WebShooter:
         # drawing both sides affordable.
         render_glow(frame, MODELS.shooter_mesh(0), self.pos, self.scale, self.rot,
                     alpha=alpha, wire=max(wire, 0.34), hot=hot, cull=False,
-                    gain=0.80, glow=0.42)
+                    scan_phase=t * 21.0, gain=1.05, glow=0.68)
 
     def _fx(self, ov, k: float, t: float, c, s: float) -> None:
         if t - self._flash < 0.55:               # materialise ripple
             f = (t - self._flash) / 0.55
             _ring(ov, c, s * (0.5 + 1.3 * f), dim(HOLO_CYAN, 0.85 * (1.0 - f)), 2)
+        if self.state == "dismiss":
+            # DE-REZ.  The housing comes apart into horizontal bands that peel
+            # upward and fade, so it dissolves like a projection losing signal
+            # instead of just shrinking - a shrink reads as an object moving
+            # away from you, which is the wrong idea entirely.
+            f = clamp01((t - self.t0) / self.DISMISS)
+            for i in range(5):
+                fi = i / 5.0
+                yb = c[1] + (fi - 0.5) * s * 0.9 - f * (1.0 + fi * 1.6) * s * 1.4
+                band = (1.0 - f) * (1.0 - 0.45 * fi)
+                cv2.line(ov, (int(c[0] - s * 0.85), int(yb)),
+                         (int(c[0] + s * 0.85), int(yb)),
+                         dim(HOLO_CYAN, 0.75 * band), 1, cv2.LINE_AA)
+        if self.state == "arrive":
+            # a horizontal scan-line sweeps down through the housing as it
+            # builds itself out of hard light, top to bottom, once
+            f = clamp01((t - self.t0) / self.ARRIVE)
+            sy = c[1] - s * 0.9 + s * 1.8 * f
+            cv2.line(ov, (int(c[0] - s * 1.15), int(sy)), (int(c[0] + s * 1.15), int(sy)),
+                     dim(HOLO_WHITE, 0.85 * (1.0 - abs(f - 0.5) * 1.2)), 2, cv2.LINE_AA)
+            cv2.line(ov, (int(c[0] - s * 1.15), int(sy)), (int(c[0] + s * 1.15), int(sy)),
+                     dim(HOLO_CYAN, 0.5), 1, cv2.LINE_AA)
         if self.state in ("held", "float", "seek"):
             _ring(ov, c, s * 1.05, dim(HOLO_CYAN, 0.35 + 0.25 * math.sin(t * 5.0)), 1)
             for i in range(6):                   # orbiting motes
@@ -328,13 +446,31 @@ class WebShooter:
                        dim(HOLO_CYAN, pulse * 0.7), 1, cv2.LINE_AA)
             cv2.circle(ov, (int(nozzle[0]), int(nozzle[1])), max(1, int(0.05 * s)),
                        dim(HOLO_WHITE, pulse), -1, cv2.LINE_AA)
+            # web-fluid cartridge readout on the underside: a small bank of
+            # ticks reporting the canister's charge, the way the real gadget
+            # would tell you it's about to run dry
+            cart = project(np.array([[-0.55, -0.62, 0.0]]), c, s, self.rot)[0]
+            level = 0.8 + 0.06 * math.sin(t * 0.5)
+            for i in range(4):
+                lit = (i / 4.0) < level
+                tx = cart[0] + i * 0.10 * s
+                cv2.line(ov, (int(tx), int(cart[1])), (int(tx), int(cart[1] - 0.16 * s)),
+                         dim(HOLO_CYAN if lit else HOLO_DEEP, 0.75 if lit else 0.35),
+                         max(1, int(0.045 * s)), cv2.LINE_AA)
             # the web-shoot pose snaps a targeting line out of the nozzle:
             # dotted filament along the aim axis with a reticle at the end
             if getattr(self, "_webpose", False):
                 self._webline(ov, c, s, t)
 
+    MULTI_LOCK_HOLD = 0.90       # seconds the pose must hold before it fans out
+
     def _webline(self, ov, c, s, t) -> None:
-        """A thin holographic web-line from the spinneret toward the aim."""
+        """A thin holographic web-line from the spinneret toward the aim.
+
+        Holding the pose past MULTI_LOCK_HOLD fans the single reticle out into
+        a three-point lock, the way the suit's multi-web targeting reads a
+        held aim as "cover more than one point" instead of just one shot.
+        """
         if self._fr is None:
             return
         p0 = project(np.array([[0.60, 0.45, 0.0]]), c, s, self.rot)[0]
@@ -354,250 +490,30 @@ class WebShooter:
             pos = e + 0.05 * s
         ex, ey = p0[0] + ux * ln, p0[1] + uy * ln     # target reticle
         rr = max(3, int(0.14 * s))
+        held = (t - self._webpose_since) if self._webpose_since is not None else 0.0
+        if held < self.MULTI_LOCK_HOLD:
+            self._reticle(ov, (ex, ey), rr, col)
+            return
+        # multi-lock: the primary reticle plus two more fanned off the aim
+        # perpendicular, all tied back to it with thin bracket lines
+        px, py = -uy, ux
+        spread = rr * 3.0 * smoothstep(clamp01((held - self.MULTI_LOCK_HOLD) / 0.35))
+        for i, off in enumerate((0.0, spread, -spread)):
+            tx, ty = ex + px * off, ey + py * off
+            self._reticle(ov, (tx, ty), int(rr * (1.0 if i == 0 else 0.72)), col)
+            if off != 0.0:
+                cv2.line(ov, (int(ex), int(ey)), (int(tx), int(ty)),
+                         dim(HOLO_CYAN, 0.30), 1, cv2.LINE_AA)
+
+    @staticmethod
+    def _reticle(ov, centre, rr, col) -> None:
+        ex, ey = centre
         cv2.circle(ov, (int(ex), int(ey)), rr, col, 1, cv2.LINE_AA)
         cv2.circle(ov, (int(ex), int(ey)), max(1, rr // 3), col, -1, cv2.LINE_AA)
         for gx, gy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
             cv2.line(ov, (int(ex + gx * rr * 1.6), int(ey + gy * rr * 1.6)),
                      (int(ex + gx * rr * 2.3), int(ey + gy * rr * 2.3)),
                      col, 1, cv2.LINE_AA)
-
-
-# --------------------------------------------------------------------------- #
-# Blueprint: the exploded engineering view of the web-shooter
-# --------------------------------------------------------------------------- #
-PART_LABELS = {
-    MODELS.WS_BAND: "01 WRIST COLLAR",
-    MODELS.WS_HOUSING: "02 CHASSIS / LOGIC DECK",
-    MODELS.WS_CART: "03 FLUID CARTRIDGE x2",
-    MODELS.WS_BARREL: "04 PRESSURE BARREL",
-    MODELS.WS_NOZZLE: "05 SPINNERET NOZZLE",
-    MODELS.WS_TRIGGER: "06 TRIGGER PAD",
-    MODELS.WS_POD: "07 STABILISER POD x2",
-    MODELS.WS_WRAP: "08 HAND WRAP / KNUCKLE PLATE",
-    MODELS.WS_REACTOR: "09 ARC REACTOR / CORE",
-}
-_SPECS = ("SHEAR      120 MPa", "FLUID      2 x 40 ml", "PRESSURE   310 bar",
-          "RANGE      18.0 m", "CYCLE      0.42 s", "MASS       0.31 kg")
-
-
-class Blueprint:
-    """An exploding, dimensioned 3D breakdown of the web-shooter.
-
-    Drawn in BLACK AND WHITE - it is a drafting hologram, not part of the blue
-    hard-light kit, and the monochrome keeps its callouts readable over the
-    blue everything else.
-
-    It does NOT rotate: a spinning schematic is impossible to read.  It holds a
-    fixed three-quarter view (with a couple of degrees of parallax sway, which
-    is what sells the depth) and does all its motion in the explode cycle.
-
-    Spawned by a single fist; stays until the fist gesture dismisses it, so it
-    can be grabbed (4 s lock) and moved anywhere on screen.
-    """
-
-    CYCLE = 6.0
-    YAW = 0.62               # fixed three-quarter presentation angle
-    PITCH = -0.28
-
-    def __init__(self, px, radius: float, t: float):
-        self.pos = (float(px[0]), float(px[1]))
-        self.scale = max(48.0, float(radius))
-        self.t = 0.0
-        self.born = t
-        self.dying = None
-        self._drag_off = (0.0, 0.0)
-        self._lock = -9.0
-        self._focus = 0
-        self._focus_t = 0.0
-
-    # -- lifecycle ---------------------------------------------------------- #
-    def alive(self) -> bool:
-        return self.dying is None or (self.t - self.dying) < 0.45
-
-    def dismiss(self) -> None:
-        if self.dying is None:
-            self.dying = self.t
-
-    def update(self, dt: float) -> None:
-        self.t += dt
-        self._focus_t += dt
-        if self._focus_t > 2.2:
-            self._focus_t = 0.0
-            self._focus = (self._focus + 1) % len(MODELS.shooter_mesh().parts)
-
-    # -- drag protocol ------------------------------------------------------ #
-    def drag_point(self):
-        return self.pos
-
-    def drag_radius(self) -> float:
-        return max(70.0, self.scale * 1.9)
-
-    def begin_drag(self, px, t: float) -> None:
-        self._lock = self.t
-        self._drag_off = (self.pos[0] - px[0], self.pos[1] - px[1])
-
-    def drag_to(self, px) -> None:
-        self.pos = (px[0] + self._drag_off[0], px[1] + self._drag_off[1])
-
-    def end_drag(self, t: float) -> None:
-        pass
-
-    # -- phase -------------------------------------------------------------- #
-    def _phase(self):
-        cyc = (self.t % self.CYCLE) / self.CYCLE
-        if cyc < 0.28:
-            return 1.0 - smoothstep(cyc / 0.28)      # assembling
-        if cyc < 0.55:
-            return 0.0                               # held together
-        if cyc < 0.80:
-            return smoothstep((cyc - 0.55) / 0.25)   # exploding
-        return 1.0                                   # inspection hold
-
-    def _alpha(self):
-        a = smoothstep(clamp01(self.t / 0.35))
-        if self.dying is not None:
-            a *= 1.0 - clamp01((self.t - self.dying) / 0.45)
-        return a
-
-    # -- render ------------------------------------------------------------- #
-    def draw(self, ov, k: float, t: float) -> None:
-        alpha = self._alpha()
-        if alpha <= 0.02:
-            return
-        spread = self._phase()
-        c = (self.pos[0] * k, self.pos[1] * k)
-        s = self.scale * k * (0.55 + 0.45 * smoothstep(clamp01(self.t / 0.35)))
-        # fixed view; the tiny sway is parallax, not rotation
-        rot = rot_matrix(self.YAW + 0.045 * math.sin(self.t * 0.55),
-                         self.PITCH + 0.03 * math.sin(self.t * 0.37), 0.0)
-        self._rot, self._c, self._s = rot, c, s
-        hot = 1.0 * (1.0 - clamp01((self.t - self._lock) / 0.5)) \
-            if self.t - self._lock < 0.5 else 0.0
-        # a ghosted un-exploded shell behind the parts: you can see where every
-        # piece came from, which is the whole point of an exploded view
-        if spread > 0.05:
-            render_mesh(ov, MODELS.shooter_mesh(), c, s, rot, alpha=alpha * 0.22,
-                        fill=MONO_DIM, edge=MONO_GREY, wire=1.0, scan=False,
-                        cull=True)
-        render_mesh(ov, MODELS.shooter_mesh(), c, s, rot,
-                    explode=0.95 * spread, alpha=min(1.0, alpha * 1.25),
-                    fill=MONO_FILL, edge=MONO_WHITE,
-                    wire=0.30 * spread, hot=hot, cull=True)
-        # containment ring + orbiting motes (mono: this is a drafting hologram)
-        pr = s * 2.0 * (0.96 + 0.04 * math.sin(self.t * 2.4))
-        _ring(ov, c, pr, dim(MONO_GREY, alpha * (0.3 + 0.2 * math.sin(self.t * 2.0))), 1)
-        for i in range(9):
-            a = self.t * 0.8 + i * 2.0 * math.pi / 9.0
-            cv2.circle(ov, (int(c[0] + math.cos(a) * pr),
-                            int(c[1] + math.sin(a) * pr * 0.42)), 2,
-                       dim(MONO_GREY, alpha * (0.35 + 0.5 *
-                                               (0.5 + 0.5 * math.sin(self.t * 5 + i)))), -1)
-        if self.t - self.born < 0.5:              # converging focus ring
-            f = (self.t - self.born) / 0.5
-            _ring(ov, c, s * (3.2 - 2.0 * f), dim(MONO_WHITE, 0.8 * (1.0 - f)), 2)
-
-    def _panel(self, w: int, h: int):
-        c, s = self.pos, self.scale
-        return (int(c[0] - s * 2.3), int(c[1] - s * 2.0),
-                int(c[0] + s * 2.3), int(c[1] + s * 2.0))
-
-    def backdrop(self, frame) -> None:
-        """Darken the frame under the sidebar, BEFORE the holograms land on it.
-
-        A schematic drawn over a lit room is unreadable no matter how bright it
-        is; knocking the background back is what makes it a panel you can read
-        rather than a tangle of lines over your face.
-        """
-        alpha = self._alpha()
-        if alpha <= 0.02:
-            return
-        h, w = frame.shape[:2]
-        x0, y0, x1, y1 = self._panel(w, h)
-        x0, y0 = max(0, x0 - 16), max(0, y0 - 34)
-        x1, y1 = min(w, x1 + 16), min(h, y1 + 34)
-        if x1 - x0 < 4 or y1 - y0 < 4:
-            return
-        roi = frame[y0:y1, x0:x1]
-        roi[:] = (roi * (1.0 - 0.55 * alpha)).astype(np.uint8)
-
-    def annotate(self, frame, t: float) -> None:
-        """Crisp full-resolution callouts, dimension lines and the spec block."""
-        alpha = self._alpha()
-        if alpha <= 0.05:
-            return
-        hud = frame                    # drawn straight on: thin, crisp geometry
-        h, w = frame.shape[:2]
-        c, s, rot = self.pos, self.scale, self._rot
-        spread = self._phase()
-        mesh = MODELS.shooter_mesh()
-        col = dim(MONO_GREY, 0.9 * alpha)
-        x0, y0, x1, y1 = self._panel(w, h)
-        cv2.rectangle(hud, (max(0, x0 - 16), max(0, y0 - 34)),
-                      (min(w, x1 + 16) - 1, min(h, y1 + 34) - 1),
-                      dim(MONO_GREY, 0.55 * alpha), 1, cv2.LINE_AA)
-        for (ax, ay, bx, by) in ((x0, y0, 1, 1), (x1, y0, -1, 1),
-                                 (x0, y1, 1, -1), (x1, y1, -1, -1)):
-            cv2.line(hud, (ax, ay), (ax + bx * 26, ay), col, 1, cv2.LINE_AA)
-            cv2.line(hud, (ax, ay), (ax, ay + by * 26), col, 1, cv2.LINE_AA)
-        cv2.line(hud, (x0, y0 - 14), (x0 + 190, y0 - 14), dim(MONO_GREY, 0.8 * alpha), 1)
-        _text(hud, "WEB-SHOOTER MK-V  //  EXPLODED", (x0, y0 - 20), 0.42,
-              dim(MONO_WHITE, alpha))
-        _text(hud, "ARACHNID OS  ::  SCHEMATIC 04-B", (x0, y1 + 22), 0.36,
-              dim(MONO_GREY, alpha))
-        # spec block down the near side
-        sx = x1 + 14 if x1 + 190 < w else x0 - 186
-        for i, line in enumerate(_SPECS):
-            bar = 0.35 + 0.5 * (0.5 + 0.5 * math.sin(t * 2.0 + i))
-            _text(hud, line, (sx, y0 + 26 + i * 19), 0.36, dim(MONO_GREY, 0.95 * alpha))
-            cv2.line(hud, (sx, y0 + 30 + i * 19), (int(sx + 60 * bar), y0 + 30 + i * 19),
-                     dim(MONO_WHITE, 0.7 * alpha), 1)
-        # part callouts: leader line from each exploded part to a label
-        if spread > 0.15:
-            for n, pid in enumerate(mesh.parts):
-                centre3 = mesh.part_centre(pid, 0.95 * spread)
-                p = project(centre3[None, :], c, s, rot)[0]
-                out = 1.0 if p[0] >= c[0] else -1.0
-                lx = p[0] + out * (s * 0.55 + 26.0)
-                ly = p[1] + (n - 3) * 6.0
-                strong = (n == self._focus)
-                lc = dim(MONO_WHITE if strong else MONO_GREY,
-                         (0.95 if strong else 0.62) * alpha)
-                cv2.line(hud, (int(p[0]), int(p[1])), (int(lx), int(ly)), lc, 1, cv2.LINE_AA)
-                cv2.line(hud, (int(lx), int(ly)), (int(lx + out * 30), int(ly)), lc, 1,
-                         cv2.LINE_AA)
-                cv2.circle(hud, (int(p[0]), int(p[1])), 3, lc, 1, cv2.LINE_AA)
-                label = PART_LABELS.get(pid, "")
-                tx = lx + out * 34 if out > 0 else lx + out * 34 - 8.2 * len(label)
-                _text(hud, label, (int(tx), int(ly) - 4), 0.36 if not strong else 0.40,
-                      lc)
-            # dimension line across the whole assembly
-            a3 = mesh.part_centre(MODELS.WS_BAND, 0.95 * spread)
-            b3 = mesh.part_centre(MODELS.WS_NOZZLE, 0.95 * spread)
-            pa, pb = project(np.stack([a3, b3]), c, s, rot)
-            _dimline(hud, pa, pb, dim(MONO_GREY, 0.85 * alpha))
-
-
-def _text(img, s: str, org, scale=0.4, colour=HOLO_CYAN, thick=1):
-    cv2.putText(img, s, (int(org[0]), int(org[1])), cv2.FONT_HERSHEY_SIMPLEX,
-                scale, colour, thick, cv2.LINE_AA)
-
-
-def _dimline(img, p1, p2, colour, dash=8, gap=6):
-    x1, y1 = float(p1[0]), float(p1[1])
-    x2, y2 = float(p2[0]), float(p2[1])
-    d = math.hypot(x2 - x1, y2 - y1)
-    if d < 2.0:
-        return
-    ux, uy = (x2 - x1) / d, (y2 - y1) / d
-    pos = 0.0
-    while pos < d:
-        e = min(d, pos + dash)
-        cv2.line(img, (int(x1 + ux * pos), int(y1 + uy * pos)),
-                 (int(x1 + ux * e), int(y1 + uy * e)), colour, 1, cv2.LINE_AA)
-        pos = e + gap
-    for (px, py) in ((x1, y1), (x2, y2)):
-        cv2.line(img, (int(px - uy * 6), int(py + ux * 6)),
-                 (int(px + uy * 6), int(py - ux * 6)), colour, 1, cv2.LINE_AA)
 
 
 # --------------------------------------------------------------------------- #
@@ -712,12 +628,14 @@ class PalmProjector:
         rot = rot_matrix(0.42 + 0.10 * math.sin(t * 0.8), -0.34,
                          fr["theta"])
         render_glow(frame, MODELS.palm_screen_mesh(), self.pos, s, rot,
-                    alpha=alpha, wire=0.30, cull=False, gain=0.80, glow=0.45)
+                    alpha=alpha, wire=0.30, cull=False,
+                    scan_phase=t * 30.0, gain=0.92, glow=0.56)
         # the rotating mini web-shooter playing on the screen
         mini = rot_matrix(t * 1.4, 0.4, 0.15)
         mc = (self.pos[0], self.pos[1] - 0.06 * s)
         render_glow(frame, MODELS.shooter_mesh(0), mc, 0.40 * s, mini,
-                    alpha=alpha, wire=0.45, cull=False, gain=0.85, glow=0.5)
+                    alpha=alpha, wire=0.45, cull=False,
+                    scan_phase=t * 30.0, gain=0.98, glow=0.60)
         # corner tag
         tag = f"{self.side.upper()} PALM  //  AR LINK"
         cv2.putText(frame, tag, (int(self.pos[0] - s * 0.9),

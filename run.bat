@@ -36,7 +36,7 @@ if errorlevel 1 (
 rem ---------- 3. run -------------------------------------------------------
 echo [run] Hologram Studio - show your hands to the camera.
 echo       WEB-SHOOT PINCH + PULL = summon / take off the shooter
-echo       FIST then OPEN = wear back / blueprint
+echo       FIST 0.45s then OPEN = wear a detached shooter back on
 echo       BOTH FISTS then OPEN = holographic body gear
 echo       OPEN PALM = hologram over the palm
 echo       G = gesture guide,  D = debug,  V = record,  R = gear,  Esc = quit.

@@ -118,10 +118,10 @@ class Hud:
                 cv2.rectangle(ov, (x, by + 13), (x + int(wlab * clamp01(prog)), by + 16),
                               dim(HOLO_WHITE, 0.85), -1)
             x += wlab + 12
-        text(ov, "WEB-SHOOT PINCH + PULL = SUMMON / TAKE OFF   |   FIST 0.6s + OPEN ="
-                 " WEAR BACK / BLUEPRINT", (28, h - 38), 0.34, dim(HOLO_BLUE, 0.85))
-        text(ov, "BOTH FISTS 0.7s = BODY GEAR   |   OPEN PALM = HOLOGRAM   |   "
-                 "GRAB 4s = MOVE   |   G = GUIDE", (28, h - 20), 0.34, dim(HOLO_BLUE, 0.85))
+        text(ov, "WEB-SHOOT PINCH + PULL = SUMMON / TAKE OFF   |   FIST 0.45s + OPEN ="
+                 " WEAR BACK", (28, h - 38), 0.34, dim(HOLO_BLUE, 0.85))
+        text(ov, "BOTH FISTS 0.55s = BODY GEAR   |   OPEN PALM = HOLOGRAM   |   "
+                 "GRAB 1.5s = MOVE   |   G = GUIDE", (28, h - 20), 0.34, dim(HOLO_BLUE, 0.85))
 
     def _hands(self, ov, w, h, t, ctx):
         for hnd in ctx.get("hands", []):
@@ -196,13 +196,14 @@ class Hud:
         lines = [
             "GESTURE GUIDE  [G]",
             "WEB-SHOOT PINCH + PULL .... summon a shooter on the OTHER wrist",
-            "  (thumb on index+middle, ring+pinky down)",
+            "  (middle+ring on the palm trigger, index+pinky out)",
             "PINCH WORN SHOOTER + PULL . take it off, drop it anywhere",
-            "FIST 0.6s + OPEN ......... wear it back / blueprint (again)",
-            "BOTH FISTS 0.7s + OPEN ... toggle BODY GEAR (R key too)",
+            "FIST 0.45s + OPEN ........ wear a detached shooter back on",
+            "BOTH FISTS 0.55s + OPEN .. toggle BODY GEAR (R key too)",
             "OPEN PALM ................ hologram above the palm",
-            "GRAB + HOLD 4s ........... move an object, release parks it",
-            "WEB-SHOOT POSE HELD ...... targeting line from the nozzle",
+            "GRAB + HOLD 1.5s ......... move an object, release parks it",
+            "WEB-SHOOT POSE HELD ...... targeting line, hold 0.9s = multi-lock",
+            "SHARP HAND MOVE .......... spider-sense ping (automatic)",
             "D ....................... gesture debug readout",
             "V ....................... record   R = gear   G = this panel",
             "ESC / Q ................. quit",

@@ -25,13 +25,6 @@ HOLO_BLUE = (255, 150, 40)       # deep blue body fill
 HOLO_DEEP = (170, 95, 25)        # shadow-side blue
 HOLO_DIM = (120, 80, 35)         # faded blue for depth layers
 
-# Monochrome set - used ONLY by the blueprint, which is a black-and-white
-# drafting hologram rather than part of the blue hard-light kit.
-MONO_WHITE = (252, 252, 252)
-MONO_GREY = (176, 176, 176)
-MONO_FILL = (86, 86, 86)
-MONO_DIM = (54, 54, 54)
-
 
 def clamp01(x: float) -> float:
     return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
@@ -232,6 +225,84 @@ class Mesh:
         return self
 
     # -- compile ------------------------------------------------------------ #
+    def _smooth_normals(self) -> None:
+        """Area-weighted vertex normals, in MODEL space.
+
+        The renderer only ever rotates the model, never deforms it, so these
+        can be baked once and rotated with the same matrix as the vertices.
+        They are what turns a tube from a ring of visibly separate facets into
+        a smooth shaded cylinder: the fill of each quad is graded from its own
+        corner normals instead of being one flat slab of Lambert.
+        """
+        fi = self.FI
+        a, b, c = self.V[fi[:, 0]], self.V[fi[:, 1]], self.V[fi[:, 2]]
+        d = self.V[fi[:, 3]]
+        # cross of the quad diagonals: for a triangle (d == c) this degrades
+        # gracefully to twice the triangle normal, so tris need no special case
+        fn = np.cross(c - a, d - b)
+        vn = np.zeros_like(self.V)
+        for k in range(4):
+            np.add.at(vn, fi[:, k], fn)      # area-weighted: fn is unnormalised
+        ln = np.linalg.norm(vn, axis=1)
+        ln[ln == 0.0] = 1.0
+        self.VN = vn / ln[:, None]
+        # Blend each corner back toward its own FACE normal by how far the two
+        # disagree.  Averaging normals unconditionally is what turns a crisp
+        # armour box into a soft blob: at a cube corner the three faces meeting
+        # there average to a diagonal and every side of the box ends up lit the
+        # same.  Curved surfaces (a tube ring, a dome) have corners that agree
+        # closely with their faces, so they smooth fully; anything folding by
+        # more than ~40 degrees stays hard.  Dot products are rotation
+        # invariant, so this whole decision bakes in at author time.
+        fl = np.linalg.norm(fn, axis=1)
+        fl[fl == 0.0] = 1.0
+        fhat = fn / fl[:, None]
+        corner = self.VN[fi]                             # (F, 4, 3)
+        agree = np.einsum("fkj,fj->fk", corner, fhat)
+        w = np.clip((agree - 0.76) / 0.18, 0.0, 1.0)[:, :, None]
+        blend = fhat[:, None, :] * (1.0 - w) + corner * w
+        bl = np.linalg.norm(blend, axis=2)
+        bl[bl == 0.0] = 1.0
+        self.CN = blend / bl[:, :, None]                 # (F, 4, 3)
+
+    def _build_edges(self) -> None:
+        """Unique edge list with the (up to two) faces on either side.
+
+        Only needed so the renderer can tell a SILHOUETTE edge - where the
+        surface folds away from the camera - from an interior panel crease.
+        Drawing those two the same way is what makes a hologram read as a
+        flat decal; a hot outline around the true occluding contour with
+        quieter creases inside it is most of what sells the volume.
+        """
+        fi = self.FI
+        ev = np.stack([fi[:, [0, 1, 2, 3]].ravel(),
+                       fi[:, [1, 2, 3, 0]].ravel()], axis=1)
+        ef = np.repeat(np.arange(len(fi), dtype=np.int32), 4)
+        live = ev[:, 0] != ev[:, 1]          # triangles carry one null edge
+        ev, ef = np.sort(ev[live], axis=1), ef[live]
+        if len(ev) == 0:
+            self.EV = np.zeros((0, 2), np.int32)
+            self.EF = np.zeros((0, 2), np.int32)
+            self.FE = np.full((len(fi), 4), -1, np.int32)
+            return
+        key = ev[:, 0].astype(np.int64) * (len(self.V) + 1) + ev[:, 1]
+        uk, inv = np.unique(key, return_inverse=True)
+        srt = np.argsort(inv, kind="stable")
+        inv_s, ef_s, ev_s = inv[srt], ef[srt], ev[srt]
+        counts = np.bincount(inv_s, minlength=len(uk))
+        start = np.concatenate([[0], np.cumsum(counts)[:-1]])
+        rank = np.arange(len(inv_s)) - np.repeat(start, counts)
+        pair = np.full((len(uk), 2), -1, np.int32)
+        pair[inv_s[rank == 0], 0] = ef_s[rank == 0]
+        pair[inv_s[rank == 1], 1] = ef_s[rank == 1]
+        self.EV = ev_s[rank == 0].astype(np.int32)
+        self.EF = pair
+        # ...and the reverse map, face-corner -> unique edge, so the draw loop
+        # can ask "is side k of this face on the silhouette?" without a lookup
+        fe = np.full(len(fi) * 4, -1, np.int32)
+        fe[np.flatnonzero(live)] = inv
+        self.FE = fe.reshape(-1, 4)
+
     def compile(self) -> "Mesh":
         self.V = np.asarray(self._v, np.float64)
         self.FI = np.asarray(self._f, np.int32)
@@ -248,6 +319,8 @@ class Mesh:
         # model like the forearm bracer sits well off its own centroid, and a
         # centroid-based radius under-sizes its scratch buffer and clips it.)
         self.radius = float(np.abs(self.V).max()) or 1.0
+        self._smooth_normals()
+        self._build_edges()
         return self
 
     def part_centre(self, pid: int, explode: float = 0.0) -> np.ndarray:
@@ -286,16 +359,28 @@ def project(v3: np.ndarray, centre, scale: float, rot: np.ndarray) -> np.ndarray
 _LIGHT = np.array([-0.42, -0.58, 0.70])
 _LIGHT /= np.linalg.norm(_LIGHT)
 
+# the second half of a quad when it is split for gradient shading
+_TRI_B = np.array([0, 2, 3])
+
 
 def render_mesh(dst, mesh: Mesh, centre, scale: float, rot: np.ndarray, *,
                 explode: float = 0.0, alpha: float = 1.0, fill=HOLO_DEEP,
                 edge=HOLO_CYAN, wire: float = 0.0, scan: bool = True,
-                hot: float = 0.0, cull: bool = False, aa: bool = True):
+                scan_phase: float = 0.0, hot: float = 0.0,
+                cull: bool = False, aa: bool = True, smooth: bool = True,
+                translucent: bool = True):
     """Painter's-algorithm render of one mesh into a BGR overlay.
 
-    wire  0 -> solid shaded, 1 -> pure wireframe (fills suppressed)
-    hot   extra white-hot boost on the edges (materialise / lock flashes)
-    cull  drop back faces - twice as fast, slightly less see-through
+    wire        0 -> solid shaded, 1 -> pure wireframe (fills suppressed)
+    hot         extra white-hot boost on the edges (materialise / lock flashes)
+    cull        drop back faces - twice as fast, slightly less see-through
+    scan_phase  scrolls the scan-lines; feed it time and the raster CREEPS down
+                the model the way a live projection does, instead of sitting
+                on it like a printed texture.
+    smooth      grade each big quad from its own corner normals instead of
+                filling it flat
+    translucent composite the far shell UNDER the near one additively, so the
+                back of the object shows through the front
     Returns the projected pixel bounding box, or None when nothing was drawn.
     """
     if mesh.V is None or alpha <= 0.01 or scale <= 0.5:
@@ -330,6 +415,12 @@ def render_mesh(dst, mesh: Mesh, centre, scale: float, rot: np.ndarray, *,
     inten *= 0.52 + 0.78 * dcue
     inten = np.where(facing > 0.0, inten, inten * 0.34)
     rim = 1.0 - np.abs(facing)
+    # Fresnel on the FILL, not just the outline.  Real volumetric hard light is
+    # brightest where you look along its surface rather than into it, so the
+    # faces turning away toward the silhouette carry more glow than the ones
+    # aimed at you.  Without this the interior reads flat and only the outline
+    # says "3D"; with it the whole body has a shell to it.
+    fres = rim * rim
     area = 0.5 * np.abs((quads[:, 2, 0] - quads[:, 0, 0]) * (quads[:, 3, 1] - quads[:, 1, 1])
                         - (quads[:, 3, 0] - quads[:, 1, 0]) * (quads[:, 2, 1] - quads[:, 0, 1]))
     xs0, xs1 = quads[:, :, 0].min(axis=1), quads[:, :, 0].max(axis=1)
@@ -339,29 +430,184 @@ def render_mesh(dst, mesh: Mesh, centre, scale: float, rot: np.ndarray, *,
         keep &= facing > 0.0
     if not keep.any():
         return None
+    # ---- smooth shading ---------------------------------------------------- #
+    # Lighting a quad from its own FLAT normal is what makes a 12-sided tube
+    # read as twelve separate metal plates.  Relighting it from the averaged
+    # corner normals of the surface instead costs one matmul for the whole
+    # mesh and collapses the facet steps into a continuous roll of light, while
+    # the flat normal is still what decides facing, culling and depth order.
+    ra = rb = smod = None
+    if smooth and getattr(mesh, "CN", None) is not None:
+        cn = (mesh.CN.reshape(-1, 3) @ rot.T).reshape(-1, 4, 3)
+        clam = cn @ _LIGHT
+        crim = 1.0 - np.abs(cn[:, :, 2])
+        cspec = np.clip(clam, 0.0, 1.0) ** 14
+        cmod = ((0.12 + 0.74 * np.abs(clam) + 0.55 * cspec)
+                * (1.0 + 0.55 * crim * crim))
+        fmod = (0.12 + 0.74 * np.abs(lam) + 0.55 * spec) * (1.0 + 0.55 * fres)
+        # ratios, not absolutes: everything the face already carries (its own
+        # shade, the depth cue, alpha, back-face damping) survives untouched
+        # and only the DISTRIBUTION of light over the surface changes.  On a
+        # hard-edged face the corner normals ARE the face normal, so the ratio
+        # is exactly 1 and the panel keeps its crisp flat tone.
+        crat = np.clip(cmod / fmod[:, None], 0.30, 2.30)
+        ra = crat[:, :3].mean(axis=1)                    # corners 0-1-2
+        rb = (crat[:, 0] + crat[:, 2] + crat[:, 3]) / 3.0  # corners 0-2-3
+        smod = 0.5 * (ra + rb)
     fcol = np.clip(np.asarray(fill, float)[None, :]
-                   * (inten * alpha * (1.0 - clamp01(wire)))[:, None], 0, 255)
-    ek = (0.16 + 0.40 * inten + 0.50 * rim * (0.45 + 0.55 * dcue) + hot) * alpha
-    ecol = np.clip(np.asarray(edge, float)[None, :] * ek[:, None], 0, 255)
+                   * (inten * (1.0 + 0.55 * fres) * alpha
+                      * (1.0 - clamp01(wire)))[:, None], 0, 255)
+    if smod is not None:
+        fcol = np.clip(fcol * smod[:, None], 0, 255)
+    # Interior creases run QUIETER than they used to: the silhouette pass below
+    # now owns the outline, and a panel line as bright as the contour is what
+    # made the old render look like a wireframe drawing rather than a lit shell.
+    ek = (0.13 + 0.33 * inten + 0.40 * rim * (0.45 + 0.55 * dcue) + hot) * alpha
+    # The glint runs WHITE-hot instead of merely a brighter blue.  A specular
+    # highlight that keeps the body hue reads as a glowing decal; one that
+    # blows out to white reads as a hard surface catching a light.
+    ehot = np.clip(0.9 * spec + hot, 0.0, 1.0)
+    ecol = np.clip((np.asarray(edge, float)[None, :] * (1.0 - ehot)[:, None]
+                    + np.asarray(HOLO_WHITE, float)[None, :] * ehot[:, None])
+                   * ek[:, None], 0, 255)
+    # Near faces carry a heavier outline than far ones - the cheapest depth cue
+    # there is.  Only above a size threshold: on a 40 px model a 2 px outline
+    # swallows the panel lines it is supposed to separate.
+    ethick = np.where((dcue > 0.62) & (scale >= 24.0), 2, 1).astype(np.int32)
     ipts = quads.astype(np.int32)
     order = np.argsort(depth)
     order = order[keep[order]]
     solid = wire < 0.98
     lt = cv2.LINE_AA if aa else cv2.LINE_8
-    fci = fcol.astype(np.int32)
-    eci = ecol.astype(np.int32)
-    for i in order:
-        poly = ipts[i]
-        if solid:
-            cv2.fillPoly(dst, [poly], (int(fci[i, 0]), int(fci[i, 1]), int(fci[i, 2])))
-        cv2.polylines(dst, [poly], True,
-                      (int(eci[i, 0]), int(eci[i, 1]), int(eci[i, 2])), 1, lt)
     bx0 = int(max(0, xs0[keep].min())); bx1 = int(min(ww, xs1[keep].max() + 1))
     by0 = int(max(0, ys0[keep].min())); by1 = int(min(hh, ys1[keep].max() + 1))
+
+    # ---- per-corner gradient ---------------------------------------------- #
+    # On top of the smoothed relight, the BIG faces get filled as two
+    # differently-lit triangles so the light rolls across them instead of
+    # stepping at the quad boundary.  Deliberately restricted to faces that
+    # are both large and carry a real spread: below that, the second fillPoly
+    # costs more than the eye gains.
+    grad = None
+    if solid and smod is not None:
+        grad = keep & (area > 130.0) & (np.abs(ra - rb) > 0.10)
+        if not grad.any():
+            grad = None
+        else:
+            fca = np.clip(fcol * (ra / smod)[:, None], 0, 255).astype(np.int32)
+            fcb = np.clip(fcol * (rb / smod)[:, None], 0, 255).astype(np.int32)
+    fci = fcol.astype(np.int32)
+    eci = ecol.astype(np.int32)
+
+    # ---- translucent layering --------------------------------------------- #
+    # Painter's algorithm alone paints the near shell straight over the far one,
+    # so a "hologram" ends up as opaque as a plastic toy.  Rendering the faces
+    # that point AWAY from us into the target first and the near ones into a
+    # scratch layer that is then ADDED means the far wall keeps showing through
+    # the near wall, and the two crossing each other reads brighter still -
+    # exactly how a volumetric projection behaves.
+    layer = None
+    back = None
+    if (translucent and solid and not cull
+            and bx1 - bx0 > 3 and by1 - by0 > 3
+            and (facing[order] <= 0.0).any() and (facing[order] > 0.0).any()):
+        layer = np.zeros((by1 - by0, bx1 - bx0, 3), np.uint8)
+        lpts = ipts - np.array([bx0, by0], np.int32)
+        back = facing <= 0.0
+        # the far shell is quieter so the sum of the two does not blow out
+        fci[back] = (fci[back] * 0.20).astype(np.int32)
+        # the creases on the far wall drop back too, or the object turns into a
+        # ball of wire with no near/far reading at all
+        eci[back] = (eci[back] * 0.18).astype(np.int32)
+        if grad is not None:
+            fca[back] = (fca[back] * 0.20).astype(np.int32)
+            fcb[back] = (fcb[back] * 0.20).astype(np.int32)
+
+    # ---- silhouette edges -------------------------------------------------- #
+    # An edge shared by a front face and a back face (or owned by a single face)
+    # is where the surface folds out of sight: the occluding contour.  Every
+    # other edge is an interior crease.  Drawing the two identically is exactly
+    # what flattens a wireframe, so contours run hot and thick while creases
+    # stay quiet.  It has to happen INSIDE the depth-sorted loop, though - these
+    # models are dozens of overlapping primitives, and a contour pass done at
+    # the end paints the outline of every buried cartridge and strap straight
+    # through the housing that should be hiding it.
+    sfl = None
+    if getattr(mesh, "FE", None) is not None and len(mesh.EF):
+        f0, f1 = mesh.EF[:, 0], mesh.EF[:, 1]
+        s1 = np.where(f1 < 0, -facing[f0], facing[np.maximum(f1, 0)])
+        sil = (facing[f0] * s1) <= 0.0
+        fe = mesh.FE
+        sfl = np.where(fe >= 0, sil[np.maximum(fe, 0)], False)   # (F, 4)
+        sany = sfl.any(axis=1)
+        segs4 = np.stack([ipts, np.roll(ipts, -1, axis=1)], axis=2)  # (F,4,2,2)
+        lseg4 = segs4 - np.array([bx0, by0], np.int32) if layer is not None else None
+        # the contour rides the same hue as the crease but far brighter, and
+        # thicker on the near half of the model so the outline itself carries
+        # depth rather than ringing the whole thing at one weight
+        scol = np.clip(ecol * (1.28 + 0.9 * hot), 0, 255).astype(np.int32)
+        if back is not None:
+            # a contour on the FAR wall has to fade with the wall it belongs
+            # to, or the outline of every buried part burns straight through
+            # the housing that is supposed to hide it
+            scol[back] = (scol[back] * 0.22).astype(np.int32)
+        sthick = np.where((dcue > 0.66) & (scale >= 40.0), 2, 1).astype(np.int32)
+
+    for i in order:
+        if layer is not None and not back[i]:
+            tgt, poly, segs = layer, lpts[i], lseg4
+        else:
+            tgt, poly, segs = dst, ipts[i], segs4
+        if solid:
+            if grad is not None and grad[i]:
+                cv2.fillPoly(tgt, [poly[:3]],
+                             (int(fca[i, 0]), int(fca[i, 1]), int(fca[i, 2])))
+                cv2.fillPoly(tgt, [poly[_TRI_B]],
+                             (int(fcb[i, 0]), int(fcb[i, 1]), int(fcb[i, 2])))
+            else:
+                cv2.fillPoly(tgt, [poly],
+                             (int(fci[i, 0]), int(fci[i, 1]), int(fci[i, 2])))
+        cv2.polylines(tgt, [poly], True,
+                      (int(eci[i, 0]), int(eci[i, 1]), int(eci[i, 2])),
+                      int(ethick[i]), lt)
+        if sfl is not None and sany[i]:
+            cv2.polylines(tgt, list(segs[i][sfl[i]]), False,
+                          (int(scol[i, 0]), int(scol[i, 1]), int(scol[i, 2])),
+                          int(sthick[i]), lt)
+    if layer is not None:
+        roi = dst[by0:by1, bx0:bx1]
+        cv2.addWeighted(layer, 1.0, roi, 1.0, 0, roi)
+
     if scan and bx1 - bx0 > 2 and by1 - by0 > 2:
-        roi = dst[by0:by1:3, bx0:bx1]
-        dst[by0:by1:3, bx0:bx1] = (roi * 0.52).astype(np.uint8)
+        _scanlines(dst, bx0, by0, bx1, by1, scan_phase)
     return (bx0, by0, bx1, by1)
+
+
+# Interference fringe: period and drift of the wide bands that roll through the
+# body of the projection, on top of the fine 3-pixel raster.
+_FRINGE = 23
+
+
+def _scanlines(dst, bx0, by0, bx1, by1, phase):
+    """Fine raster + drifting interference fringes over the model's footprint.
+
+    The fine 1-in-3 raster already said "projection".  The wide, slow fringe
+    on top of it is the other half of the tell: real volumetric displays beat
+    against themselves, and the banding drifts at a different rate from the
+    scan.  Both are strided slices, so this touches well under half the pixels
+    in the box.
+    """
+    ys = by0 + int(phase) % 3
+    if ys < by1:
+        roi = dst[ys:by1:3, bx0:bx1]
+        dst[ys:by1:3, bx0:bx1] = (roi * 0.52).astype(np.uint8)
+    f0 = by0 + int(by0 - phase * 0.55) % _FRINGE
+    for off in range(3):
+        y = f0 + off
+        if y >= by1:
+            break
+        roi = dst[y:by1:_FRINGE, bx0:bx1]
+        dst[y:by1:_FRINGE, bx0:bx1] = (roi * (0.66 + 0.11 * off)).astype(np.uint8)
 
 
 def screen_radius(mesh: Mesh, scale: float) -> float:
